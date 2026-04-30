@@ -246,6 +246,24 @@ pub struct McpFilmLoopFrameMember {
     pub cast_lib: i32,
     pub cast_member: i32,
     pub name: String,
+    /// Director loc_h/loc_v: pixel position in the filmLoop's local
+    /// coordinate space. The sprite is anchored at its cast member's
+    /// regPoint — the renderer must translate by (-regX, -regY) to get
+    /// the top-left draw position.
+    pub loc_h: i32,
+    pub loc_v: i32,
+    /// On-stage display size, resolved with Director's "stretch off →
+    /// bitmap natural size" rule already applied. Renderer can use
+    /// these directly without consulting member metadata.
+    pub width: i32,
+    pub height: i32,
+    pub rotation: f64,
+    pub skew: f64,
+    /// Blend opacity, 0..=100 percent (0 = transparent, 100 = opaque).
+    /// Already converted from Director's raw byte (D5-D7 direct,
+    /// D8+ inverted 0-255).
+    pub blend: u8,
+    pub ink: u8,
 }
 
 #[derive(Serialize)]
@@ -1139,6 +1157,25 @@ pub fn mcp_get_cast_member_picture(
     })
 }
 
+/// Convert Director's raw blend byte to a 0..=100 opacity percentage.
+/// Matches score.rs:182 `convert_raw_blend` semantics — D8+ uses an inverted
+/// 0-255 scale, D5-D7 stores the percentage directly with 0 meaning opaque.
+fn raw_blend_to_percent(raw: u8, dir_version: u16) -> u8 {
+    if dir_version >= 700 {
+        if raw == 0 {
+            100
+        } else if raw == 255 {
+            0
+        } else {
+            (((255.0 - raw as f32) * 100.0 / 255.0) as i32).clamp(0, 100) as u8
+        }
+    } else if raw == 0 {
+        100
+    } else {
+        raw.min(100)
+    }
+}
+
 /// Resolve effective tempo for a 1-based frame.
 /// `tempo_data` is `(frame_idx_zero_based, TempoChannelData)` ascending.
 /// Returns `(duration_ticks, duration_ms)` with default 30 fps when no
@@ -1287,17 +1324,21 @@ pub fn mcp_get_film_loop_frames(
     let frame_count = film_loop.score.frame_count.unwrap_or(computed_count);
 
     let filmloop_cast_lib = cast_lib;
+    let dir_version = player.movie.dir_version;
 
-    // Resolve the active member for a span at frame `frame_num`. We walk
-    // init_data entries whose 1-based frame is within [span.start_frame,
-    // frame_num] AND whose channel matches the span. The latest such entry
-    // with `cast_member != 0` wins. This scopes deltas to the span's lifetime
-    // — matching Director's runtime, where a sprite enters at start_frame
-    // (with whatever cast member init_data had at that frame), can swap mid-
-    // span, then leaves at end_frame so the next span on the same channel
-    // starts fresh.
-    let resolve_span_member = |span: &LoopSpan, frame_num: u32| -> Option<&ScoreFrameChannelData> {
-        let mut current: Option<&ScoreFrameChannelData> = None;
+    // Walk init_data entries whose 1-based frame is within [span.start_frame,
+    // frame_num] AND whose channel matches the span. Build a delta-merged
+    // `ScoreFrameChannelData` snapshot scoped to the span — matches the
+    // runtime sequence (sprite enters at start_frame with init values, deltas
+    // mutate it within the span, leaves at end_frame so the next span on
+    // the same channel starts fresh).
+    //
+    // For tween-driven properties (pos/size/rotation/skew/blend), the score
+    // chunk's keyframes_cache provides absolute values per frame and is
+    // consulted as an override after the delta merge — that path captures
+    // anything Director resolved as a tween rather than a raw delta.
+    let resolve_span_data = |span: &LoopSpan, frame_num: u32| -> Option<ScoreFrameChannelData> {
+        let mut current: Option<ScoreFrameChannelData> = None;
         for (frame_idx, channel_idx, data) in init_data.iter() {
             let f_1based = frame_idx + 1;
             if f_1based < span.start_frame {
@@ -1309,8 +1350,33 @@ pub fn mcp_get_film_loop_frames(
             if get_channel_number_from_index(*channel_idx as u32) != span.channel {
                 continue;
             }
-            if data.cast_member != 0 {
-                current = Some(data);
+            // Director uses dense per-frame writes for tweened sprites in
+            // D5+, with sentinel zeros for "no change" on a few fields:
+            //   - cast_member == 0 → keep prior member
+            //   - width/height == 0 → keep prior size
+            // Other fields (pos, rotation, skew, blend, ink, stretch) are
+            // written every frame and overwrite directly.
+            match current.as_mut() {
+                None => current = Some(data.clone()),
+                Some(cur) => {
+                    if data.cast_member != 0 {
+                        cur.cast_lib = data.cast_lib;
+                        cur.cast_member = data.cast_member;
+                    }
+                    cur.pos_x = data.pos_x;
+                    cur.pos_y = data.pos_y;
+                    if data.width != 0 {
+                        cur.width = data.width;
+                    }
+                    if data.height != 0 {
+                        cur.height = data.height;
+                    }
+                    cur.rotation = data.rotation;
+                    cur.skew = data.skew;
+                    cur.blend = data.blend;
+                    cur.ink = data.ink;
+                    cur.stretch = data.stretch;
+                }
             }
         }
         current
@@ -1326,9 +1392,9 @@ pub fn mcp_get_film_loop_frames(
 
         let mut members: Vec<McpFilmLoopFrameMember> = Vec::new();
         for span in active_spans {
-            let data = match resolve_span_member(span, frame_num) {
-                Some(d) => d,
-                None => continue, // Span has no member yet — skip silently.
+            let data = match resolve_span_data(span, frame_num) {
+                Some(d) if d.cast_member != 0 => d,
+                _ => continue, // Span has no resolvable member yet — skip.
             };
             // Resolve cast_lib: 65535 ("relative to parent cast") and 0 both
             // fall back to the filmloop's own cast (matches score.rs:920-926
@@ -1342,17 +1408,79 @@ pub fn mcp_get_film_loop_frames(
                 cast_lib: resolved_cast_lib,
                 cast_member: data.cast_member as i32,
             };
-            let name = player
-                .movie
-                .cast_manager
-                .find_member_by_ref(&member_ref)
+            let resolved_member = player.movie.cast_manager.find_member_by_ref(&member_ref);
+            let name = resolved_member
                 .map(|m| m.name.clone())
                 .unwrap_or_default();
+
+            // Start from the delta-merged init values, then let
+            // keyframes_cache override per-frame transforms.
+            let mut loc_h = data.pos_x as i32;
+            let mut loc_v = data.pos_y as i32;
+            let mut width = data.width as i32;
+            let mut height = data.height as i32;
+            let mut rotation = data.rotation;
+            let mut skew = data.skew;
+            let mut blend_pct = raw_blend_to_percent(data.blend, dir_version);
+
+            if let Some(kf) = film_loop.score.keyframes_cache.get(&(span.channel as u16)) {
+                if let Some(path) = kf.path.as_ref() {
+                    if let Some((x, y)) = path.get_position_at_frame(frame_num) {
+                        loc_h = x as i32;
+                        loc_v = y as i32;
+                    }
+                }
+                if let Some(size_kf) = kf.size.as_ref() {
+                    if let Some((w, h)) = size_kf.get_size_at_frame(frame_num) {
+                        width = w as i32;
+                        height = h as i32;
+                    }
+                }
+                if let Some(rot_kf) = kf.rotation.as_ref() {
+                    if let Some(r) = rot_kf.get_rotation_at_frame(frame_num) {
+                        rotation = r;
+                    }
+                }
+                if let Some(skew_kf) = kf.skew.as_ref() {
+                    if let Some(s) = skew_kf.get_skew_at_frame(frame_num) {
+                        skew = s;
+                    }
+                }
+                if let Some(blend_kf) = kf.blend.as_ref() {
+                    if let Some(b) = blend_kf.get_blend_at_frame(frame_num) {
+                        blend_pct = b;
+                    }
+                }
+            }
+
+            // Apply Director's "stretch off → bitmap natural size" rule
+            // (score.rs:4184-4196) so the renderer doesn't have to look up
+            // bitmap meta. Only kicks in for Bitmap members; non-bitmap
+            // members fall through with whatever size was tweened.
+            if !data.stretch {
+                if let Some(member) = resolved_member {
+                    if let CastMemberType::Bitmap(bmp) = &member.member_type {
+                        if bmp.info.width > 0 && bmp.info.height > 0 {
+                            width = bmp.info.width as i32;
+                            height = bmp.info.height as i32;
+                        }
+                    }
+                }
+            }
+
             members.push(McpFilmLoopFrameMember {
                 channel: span.channel,
                 cast_lib: resolved_cast_lib,
                 cast_member: data.cast_member as i32,
                 name,
+                loc_h,
+                loc_v,
+                width,
+                height,
+                rotation,
+                skew,
+                blend: blend_pct,
+                ink: data.ink,
             });
         }
 
