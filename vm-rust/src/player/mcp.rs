@@ -257,6 +257,13 @@ pub struct McpFilmLoopFrame {
 }
 
 #[derive(Serialize)]
+pub struct McpFilmLoopSpan {
+    pub channel: u32,
+    pub start_frame: u32,
+    pub end_frame: u32,
+}
+
+#[derive(Serialize)]
 pub struct McpFilmLoopFrames {
     pub cast_lib: i32,
     pub cast_member: i32,
@@ -268,6 +275,7 @@ pub struct McpFilmLoopFrames {
     pub reg_y: i16,
     pub loops: bool,
     pub default_duration_ms: u32,
+    pub sprite_spans: Vec<McpFilmLoopSpan>,
     pub frames: Vec<McpFilmLoopFrame>,
 }
 
@@ -1183,8 +1191,6 @@ pub fn mcp_get_film_loop_frames(
     cast_lib: i32,
     cast_member: i32,
 ) -> String {
-    use std::collections::HashMap;
-
     let cast = match player.movie.cast_manager.get_cast(cast_lib as u32) {
         Ok(c) => c,
         Err(_) => return mcp_error(format!("Cast library {} not found", cast_lib)),
@@ -1207,109 +1213,151 @@ pub fn mcp_get_film_loop_frames(
     };
 
     // Sort init data defensively by (frame_idx, channel_idx). The reader emits
-    // it in frame-ascending order, but if that ever changes, the delta-merge
-    // below would silently produce wrong frames.
-    let mut init_data: Vec<&(u32, u16, ScoreFrameChannelData)> =
-        film_loop.score.channel_initialization_data.iter().collect();
+    // it in frame-ascending order, but if that ever changes, the per-span
+    // resolution below would silently produce wrong frames.
+    let mut init_data: Vec<(u32, u16, ScoreFrameChannelData)> =
+        film_loop.score.channel_initialization_data.clone();
     init_data.sort_by_key(|(frame_idx, channel_idx, _)| (*frame_idx, *channel_idx));
 
     let mut tempo_data: Vec<(u32, crate::director::chunks::score::TempoChannelData)> =
         film_loop.score.tempo_channel_data.clone();
     tempo_data.sort_by_key(|(frame_idx, _)| *frame_idx);
 
-    // Determine frame count. Prefer score.frame_count; fall back to the max
-    // frame_idx found across init/tempo/sprite_spans + 1 (since indices are
-    // zero-based but our manifest is 1-based).
-    let max_init_frame = init_data
-        .iter()
-        .map(|(f, _, _)| *f + 1)
-        .max()
-        .unwrap_or(0);
+    // Build the authoritative per-channel sprite spans from
+    // `score_chunk.frame_intervals` (D6+). Each (primary, _secondary) pair
+    // describes one sprite span: primary.{start_frame, end_frame, channel_index}
+    // mark when a sprite is alive on a channel; the secondary entry holds the
+    // span's behavior script ref, NOT the sprite's member (per score.rs:2562
+    // — the runtime uses delta-merged channel_initialization_data within the
+    // span range to pick the actual cast member).
+    //
+    // For pre-D6 / fallback movies with empty frame_intervals, fall back to
+    // the score's already-derived sprite_spans (built from
+    // generate_sprite_spans_from_channel_data).
+    #[derive(Clone, Copy)]
+    struct LoopSpan {
+        channel: u32,
+        start_frame: u32,
+        end_frame: u32,
+    }
+    let spans: Vec<LoopSpan> = if !film_loop.score_chunk.frame_intervals.is_empty() {
+        film_loop
+            .score_chunk
+            .frame_intervals
+            .iter()
+            .filter_map(|(primary, _)| {
+                // Skip frame-script (channel 0) and the 5 reserved effect
+                // channels (1-5 raw → channel_number 0).
+                if primary.channel_index <= 5 {
+                    return None;
+                }
+                let channel = get_channel_number_from_index(primary.channel_index);
+                if channel == 0 {
+                    return None;
+                }
+                Some(LoopSpan {
+                    channel,
+                    start_frame: primary.start_frame,
+                    end_frame: primary.end_frame,
+                })
+            })
+            .collect()
+    } else {
+        film_loop
+            .score
+            .sprite_spans
+            .iter()
+            .filter(|s| s.channel_number >= 1)
+            .map(|s| LoopSpan {
+                channel: s.channel_number,
+                start_frame: s.start_frame,
+                end_frame: s.end_frame,
+            })
+            .collect()
+    };
+
+    // Determine frame count. Prefer score.frame_count; fall back to maxes.
+    let max_init_frame = init_data.iter().map(|(f, _, _)| *f + 1).max().unwrap_or(0);
     let max_tempo_frame = tempo_data.iter().map(|(f, _)| *f + 1).max().unwrap_or(0);
-    let max_span_frame = film_loop
-        .score
-        .sprite_spans
-        .iter()
-        .map(|s| s.end_frame)
-        .max()
-        .unwrap_or(0);
+    let max_span_frame = spans.iter().map(|s| s.end_frame).max().unwrap_or(0);
     let computed_count = max_init_frame
         .max(max_tempo_frame)
         .max(max_span_frame)
         .max(1);
     let frame_count = film_loop.score.frame_count.unwrap_or(computed_count);
 
-    // For each frame, fold init_data deltas into a per-channel "current member"
-    // map. cast_member==0 is Director's "no change" delta sentinel for member
-    // refs (matches score.rs:910-914 runtime behavior).
-    let mut current_by_channel: HashMap<u16, ScoreFrameChannelData> = HashMap::new();
-    let mut init_cursor: usize = 0;
-
     let filmloop_cast_lib = cast_lib;
-    let mut frames: Vec<McpFilmLoopFrame> = Vec::with_capacity(frame_count as usize);
 
-    for frame_num in 1..=frame_count {
-        // Advance cursor to absorb all entries with frame_idx + 1 <= frame_num.
-        while init_cursor < init_data.len() {
-            let (frame_idx, channel_idx, data) = init_data[init_cursor];
-            if frame_idx + 1 > frame_num {
+    // Resolve the active member for a span at frame `frame_num`. We walk
+    // init_data entries whose 1-based frame is within [span.start_frame,
+    // frame_num] AND whose channel matches the span. The latest such entry
+    // with `cast_member != 0` wins. This scopes deltas to the span's lifetime
+    // — matching Director's runtime, where a sprite enters at start_frame
+    // (with whatever cast member init_data had at that frame), can swap mid-
+    // span, then leaves at end_frame so the next span on the same channel
+    // starts fresh.
+    let resolve_span_member = |span: &LoopSpan, frame_num: u32| -> Option<&ScoreFrameChannelData> {
+        let mut current: Option<&ScoreFrameChannelData> = None;
+        for (frame_idx, channel_idx, data) in init_data.iter() {
+            let f_1based = frame_idx + 1;
+            if f_1based < span.start_frame {
+                continue;
+            }
+            if f_1based > frame_num {
                 break;
             }
-            if data.cast_member != 0 {
-                current_by_channel.insert(*channel_idx, data.clone());
+            if get_channel_number_from_index(*channel_idx as u32) != span.channel {
+                continue;
             }
-            init_cursor += 1;
+            if data.cast_member != 0 {
+                current = Some(data);
+            }
         }
+        current
+    };
 
-        // Emit one entry per active sprite channel (channel_number >= 1).
-        // Sort by channel for deterministic output.
-        let mut active: Vec<(u32, &ScoreFrameChannelData)> = current_by_channel
+    let mut frames: Vec<McpFilmLoopFrame> = Vec::with_capacity(frame_count as usize);
+    for frame_num in 1..=frame_count {
+        let mut active_spans: Vec<&LoopSpan> = spans
             .iter()
-            .filter_map(|(raw_idx, data)| {
-                let channel_number = get_channel_number_from_index(*raw_idx as u32);
-                if channel_number >= 1 && data.cast_member != 0 {
-                    Some((channel_number, data))
-                } else {
-                    None
-                }
-            })
+            .filter(|s| s.start_frame <= frame_num && frame_num <= s.end_frame)
             .collect();
-        active.sort_by_key(|(ch, _)| *ch);
+        active_spans.sort_by_key(|s| s.channel);
 
-        let members: Vec<McpFilmLoopFrameMember> = active
-            .into_iter()
-            .map(|(channel, data)| {
-                // Resolve cast_lib: 65535 ("relative to parent cast") and 0
-                // both fall back to the filmloop's own cast (matches
-                // score.rs:920-926 plus the filmloop comment at score.rs:235).
-                let resolved_cast_lib =
-                    if data.cast_lib == 65535 || data.cast_lib == 0 {
-                        filmloop_cast_lib
-                    } else {
-                        data.cast_lib as i32
-                    };
-                let member_ref = CastMemberRef {
-                    cast_lib: resolved_cast_lib,
-                    cast_member: data.cast_member as i32,
-                };
-                let name = player
-                    .movie
-                    .cast_manager
-                    .find_member_by_ref(&member_ref)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_default();
-                McpFilmLoopFrameMember {
-                    channel,
-                    cast_lib: resolved_cast_lib,
-                    cast_member: data.cast_member as i32,
-                    name,
-                }
-            })
-            .collect();
+        let mut members: Vec<McpFilmLoopFrameMember> = Vec::new();
+        for span in active_spans {
+            let data = match resolve_span_member(span, frame_num) {
+                Some(d) => d,
+                None => continue, // Span has no member yet — skip silently.
+            };
+            // Resolve cast_lib: 65535 ("relative to parent cast") and 0 both
+            // fall back to the filmloop's own cast (matches score.rs:920-926
+            // plus the filmloop comment at score.rs:235).
+            let resolved_cast_lib = if data.cast_lib == 65535 || data.cast_lib == 0 {
+                filmloop_cast_lib
+            } else {
+                data.cast_lib as i32
+            };
+            let member_ref = CastMemberRef {
+                cast_lib: resolved_cast_lib,
+                cast_member: data.cast_member as i32,
+            };
+            let name = player
+                .movie
+                .cast_manager
+                .find_member_by_ref(&member_ref)
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+            members.push(McpFilmLoopFrameMember {
+                channel: span.channel,
+                cast_lib: resolved_cast_lib,
+                cast_member: data.cast_member as i32,
+                name,
+            });
+        }
 
         let (duration_ticks, duration_ms) =
             resolve_film_loop_frame_tempo(&tempo_data, frame_num);
-
         frames.push(McpFilmLoopFrame {
             frame: frame_num,
             duration_ticks,
@@ -1319,6 +1367,17 @@ pub fn mcp_get_film_loop_frames(
     }
 
     let default_duration_ms = frames.first().map(|f| f.duration_ms).unwrap_or(33);
+
+    let sprite_spans: Vec<McpFilmLoopSpan> = film_loop
+        .score
+        .sprite_spans
+        .iter()
+        .map(|s| McpFilmLoopSpan {
+            channel: s.channel_number,
+            start_frame: s.start_frame,
+            end_frame: s.end_frame,
+        })
+        .collect();
 
     to_json(&McpFilmLoopFrames {
         cast_lib,
@@ -1331,6 +1390,7 @@ pub fn mcp_get_film_loop_frames(
         reg_y: film_loop.info.reg_point.1,
         loops: film_loop.info.loops != 0,
         default_duration_ms,
+        sprite_spans,
         frames,
     })
 }
