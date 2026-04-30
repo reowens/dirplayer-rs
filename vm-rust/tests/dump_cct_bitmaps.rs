@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::mcp_get_cast_member_picture;
+use vm_rust::player::mcp::{mcp_get_cast_member_picture, mcp_get_film_loop_frames};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -123,6 +123,7 @@ async fn dump_inner() {
 
         // Snapshot bitmap targets.
         let mut targets: Vec<(i32, i32, String)> = Vec::new();
+        let mut film_loop_targets: Vec<(i32, i32, String)> = Vec::new();
         let mut bg_target: Option<(i32, i32, String)> = None;
         // Fall back to "<base>_bg" if no override was provided.
         let bg_name: String = if bg_name_override.is_empty() {
@@ -133,18 +134,31 @@ async fn dump_inner() {
         reserve_player_ref(|player| {
             for cast in player.movie.cast_manager.casts.iter() {
                 for (member_num, member) in cast.members.iter() {
-                    if matches!(member.member_type, CastMemberType::Bitmap(_)) {
-                        let name = if member.name.is_empty() {
-                            format!("member_{}", member_num)
-                        } else {
-                            member.name.clone()
-                        };
-                        let cl = cast.number as i32;
-                        let cm = *member_num as i32;
-                        if name == bg_name {
-                            bg_target = Some((cl, cm, name.clone()));
+                    let cl = cast.number as i32;
+                    let cm = *member_num as i32;
+                    match &member.member_type {
+                        CastMemberType::Bitmap(_) => {
+                            let name = if member.name.is_empty() {
+                                format!("member_{}", member_num)
+                            } else {
+                                member.name.clone()
+                            };
+                            if name == bg_name {
+                                bg_target = Some((cl, cm, name.clone()));
+                            }
+                            targets.push((cl, cm, name));
                         }
-                        targets.push((cl, cm, name));
+                        CastMemberType::FilmLoop(_) => {
+                            // FilmLoops have no PNG of their own — their
+                            // frames are individual bitmap members already
+                            // covered above. We capture them here so we can
+                            // emit a `_frames.json` manifest the Furni
+                            // translator + runtime can read.
+                            if !member.name.is_empty() {
+                                film_loop_targets.push((cl, cm, member.name.clone()));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -225,6 +239,36 @@ async fn dump_inner() {
             let meta_json = serde_json::to_string_pretty(&members_meta).expect("serialize members meta");
             fs::write(&meta_path, meta_json).expect("write _members.json");
             summary.push(format!("    members.json: {} entries → {}", members_meta.len(), meta_path));
+        }
+
+        // Emit a `<filmloop_name>_frames.json` manifest for every filmLoop
+        // in this room's cct. The manifest holds per-frame member refs +
+        // baked transforms (loc_h/loc_v/width/height/rotation/skew/blend/ink)
+        // + per-frame duration_ms from the tempo channel, so the renderer
+        // can drive a sprite ensemble per filmLoop without re-parsing the
+        // cast or interpolating tweens client-side.
+        let mut film_loops_written = 0usize;
+        for (cl, cm, name) in &film_loop_targets {
+            let json = reserve_player_ref(|player| mcp_get_film_loop_frames(player, *cl, *cm));
+            // Skip writing on handler errors (mcp_error returns
+            // `{"error": "..."}`); real manifests always include "frame_count".
+            if !json.contains("\"frame_count\"") {
+                summary.push(format!(
+                    "    filmLoop {} skipped: {}",
+                    name,
+                    json.lines().next().unwrap_or("(empty)")
+                ));
+                continue;
+            }
+            let out_path = format!("{}/{}_frames.json", fg_dest_dir, name);
+            fs::write(&out_path, json).expect("write filmLoop frames manifest");
+            film_loops_written += 1;
+        }
+        if film_loops_written > 0 {
+            summary.push(format!(
+                "    filmLoop manifests: {} → {}/<name>_frames.json",
+                film_loops_written, fg_dest_dir
+            ));
         }
 
         // Sanity stat: how many of the canonical.roomBitmaps members we
