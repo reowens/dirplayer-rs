@@ -589,6 +589,20 @@ pub fn mcp_inspect_cast_member(cast_lib: i32, cast_member: i32) -> String {
 }
 
 #[wasm_bindgen]
+pub fn mcp_get_cast_member_picture(cast_lib: i32, cast_member: i32) -> String {
+    reserve_player_ref(|player| {
+        player::mcp::mcp_get_cast_member_picture(player, cast_lib, cast_member)
+    })
+}
+
+#[wasm_bindgen]
+pub fn mcp_get_film_loop_frames(cast_lib: i32, cast_member: i32) -> String {
+    reserve_player_ref(|player| {
+        player::mcp::mcp_get_film_loop_frames(player, cast_lib, cast_member)
+    })
+}
+
+#[wasm_bindgen]
 pub fn mcp_list_breakpoints() -> String {
     reserve_player_ref(|player| player::mcp::mcp_list_breakpoints(player))
 }

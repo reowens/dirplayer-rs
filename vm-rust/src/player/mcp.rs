@@ -7,6 +7,7 @@ use fxhash::FxHashMap;
 use serde::Serialize;
 
 use crate::{director::{
+    chunks::score::ScoreFrameChannelData,
     enums::ScriptType,
     file::get_variable_multiplier,
     lingo::{decompiler::handler::decompile_handler, script::ScriptContext as LingoScriptContext},
@@ -15,7 +16,9 @@ use crate::{director::{
 use super::{
     allocator::{DatumAllocatorTrait, ScriptInstanceAllocatorTrait},
     cast_lib::{CastLib, CastMemberRef},
+    cast_member::CastMemberType,
     datum_ref::DatumId,
+    score::get_channel_number_from_index,
     script::Script,
     DirPlayer,
 };
@@ -193,6 +196,17 @@ pub struct McpCastMemberInfo {
     pub cast_member: i32,
     pub name: String,
     pub member_type: String,
+    /// Bitmap-only fields. Zero/false for non-bitmap members.
+    /// `reg_x` / `reg_y` are the cast member's registration point; Director
+    /// sprites position by regPoint, so downstream renderers need this to
+    /// translate `(locH, locV)` from upstream SceneXml into top-left anchors.
+    pub reg_x: i16,
+    pub reg_y: i16,
+    pub bit_depth: u8,
+    pub use_alpha: bool,
+    pub palette_id: i16,
+    pub width: u16,
+    pub height: u16,
 }
 
 #[derive(Serialize)]
@@ -203,6 +217,58 @@ pub struct McpCastMemberDetails {
     pub member_type: String,
     pub script_type: Option<String>,
     pub handlers: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+pub struct McpCastMemberPicture {
+    pub cast_lib: i32,
+    pub cast_member: i32,
+    pub name: String,
+    pub width: u16,
+    pub height: u16,
+    pub bit_depth: u8,
+    pub original_bit_depth: u8,
+    pub reg_x: i16,
+    pub reg_y: i16,
+    pub use_alpha: bool,
+    pub palette_ref: String,
+    /// Length of the underlying RGBA buffer in bytes.
+    pub data_len: usize,
+    /// First 64 bytes of the bitmap's `data` buffer, hex-encoded — diagnostic.
+    pub data_head_hex: String,
+    /// Base64-encoded PNG. RGBA pixels resolved via the bitmap's palette.
+    pub png_base64: String,
+}
+
+#[derive(Serialize)]
+pub struct McpFilmLoopFrameMember {
+    pub channel: u32,
+    pub cast_lib: i32,
+    pub cast_member: i32,
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct McpFilmLoopFrame {
+    pub frame: u32,
+    pub duration_ticks: u32,
+    pub duration_ms: u32,
+    pub members: Vec<McpFilmLoopFrameMember>,
+}
+
+#[derive(Serialize)]
+pub struct McpFilmLoopFrames {
+    pub cast_lib: i32,
+    pub cast_member: i32,
+    pub name: String,
+    pub frame_count: u32,
+    pub width: u16,
+    pub height: u16,
+    pub reg_x: i16,
+    pub reg_y: i16,
+    pub loops: bool,
+    pub default_duration_ms: u32,
+    pub frames: Vec<McpFilmLoopFrame>,
 }
 
 #[derive(Serialize)]
@@ -876,11 +942,33 @@ pub fn mcp_list_cast_members(player: &DirPlayer, cast_lib: Option<i32>) -> Strin
         .iter()
         .filter(|cast| cast_lib.map_or(true, |lib| cast.number as i32 == lib))
         .flat_map(|cast| {
-            cast.members.iter().map(move |(&member_num, member)| McpCastMemberInfo {
-                cast_lib: cast.number as i32,
-                cast_member: member_num as i32,
-                name: member.name.clone(),
-                member_type: member.member_type.type_string().to_string(),
+            cast.members.iter().map(move |(&member_num, member)| {
+                let bm = member.member_type.as_bitmap();
+                // Honor BitmapInfo.center_reg_point: when true, Director's
+                // runtime substitutes (width/2, height/2) for the stored
+                // reg_point at composite (see player/score.rs:4230). Resolve
+                // the effective regPoint here so downstream consumers don't
+                // need to know about the flag.
+                let (reg_x, reg_y) = bm.map(|b| {
+                    if b.info.center_reg_point && b.info.width > 0 && b.info.height > 0 {
+                        ((b.info.width / 2) as i16, (b.info.height / 2) as i16)
+                    } else {
+                        b.reg_point
+                    }
+                }).unwrap_or((0, 0));
+                McpCastMemberInfo {
+                    cast_lib: cast.number as i32,
+                    cast_member: member_num as i32,
+                    name: member.name.clone(),
+                    member_type: member.member_type.type_string().to_string(),
+                    reg_x,
+                    reg_y,
+                    bit_depth: bm.map(|b| b.info.bit_depth).unwrap_or(0),
+                    use_alpha: bm.map(|b| b.info.use_alpha).unwrap_or(false),
+                    palette_id: bm.map(|b| b.info.palette_id).unwrap_or(0),
+                    width: bm.map(|b| b.info.width).unwrap_or(0),
+                    height: bm.map(|b| b.info.height).unwrap_or(0),
+                }
             })
         })
         .collect();
@@ -922,6 +1010,328 @@ pub fn mcp_inspect_cast_member(player: &DirPlayer, cast_lib: i32, cast_member: i
         member_type: member.member_type.type_string().to_string(),
         script_type,
         handlers,
+    })
+}
+
+/// Render a Bitmap cast member to PNG (palette-resolved RGBA) and return as
+/// base64. Lets external tools dump per-room overlays without needing access
+/// to the raw cast file format.
+pub fn mcp_get_cast_member_picture(
+    player: &DirPlayer,
+    cast_lib: i32,
+    cast_member: i32,
+) -> String {
+    use base64::Engine;
+    use image::{ImageFormat, RgbaImage};
+
+    let cast = match player.movie.cast_manager.get_cast(cast_lib as u32) {
+        Ok(c) => c,
+        Err(_) => return mcp_error(format!("Cast library {} not found", cast_lib)),
+    };
+    let member = match cast.members.get(&(cast_member as u32)) {
+        Some(m) => m,
+        None => return mcp_error(format!(
+            "Cast member {} not found in cast library {}",
+            cast_member, cast_lib
+        )),
+    };
+    let bitmap_member = match member.member_type.as_bitmap() {
+        Some(b) => b,
+        None => return mcp_error(format!(
+            "Cast member {}/{} is not a Bitmap (type: {})",
+            cast_lib,
+            cast_member,
+            member.member_type.type_string()
+        )),
+    };
+    let bitmap = match player.bitmap_manager.get_bitmap(bitmap_member.image_ref) {
+        Some(b) => b,
+        None => return mcp_error(format!(
+            "Bitmap data for cast member {}/{} not loaded",
+            cast_lib, cast_member
+        )),
+    };
+
+    let palettes = player.movie.cast_manager.palettes();
+    let width = bitmap.width;
+    let height = bitmap.height;
+    // Director's 32bpp bitmaps store ARGB but the alpha channel is only
+    // semantically valid when `use_alpha` is true. For opaque 32bpp images
+    // (eg. room backgrounds with `useAlpha=false` in Lingo), the stored
+    // alpha bytes are zero and have to be forced to 0xFF or the dumped PNG
+    // is fully transparent. 8bpp indexed bitmaps already return a=0xFF
+    // unconditionally upstream, so this only affects the 32bpp path.
+    let force_opaque_32bpp = bitmap.bit_depth == 32 && !bitmap.use_alpha;
+    let mut img = RgbaImage::new(width as u32, height as u32);
+    for y in 0..height {
+        for x in 0..width {
+            let (r, g, b, a) = bitmap.get_pixel_color_with_alpha(&palettes, x, y);
+            let mut a = a;
+            // 32bpp force-opaque: only flip alpha=>255 when the pixel has
+            // non-zero RGB. Room backgrounds (tokyo_bg etc.) have visible
+            // RGB content + a true-black (0,0,0,0) diamond margin that should
+            // stay transparent for the room cutout. Effect overlays
+            // (tokyo_bear_headlight, tokyo_pitlight) are 32bpp non-use-alpha
+            // bitmaps that are mostly all-zero and intended to render
+            // transparent at composite time; the pixel-aware check keeps
+            // those zeros transparent while making real content opaque.
+            if force_opaque_32bpp && (r != 0 || g != 0 || b != 0) {
+                a = 0xFF;
+            }
+            // NB: 8bpp ink=8 (Background Transparent) chroma-keying is
+            // deliberately NOT applied here. Ink mode is a per-sprite
+            // property in Director (lives on the SceneXml element, not
+            // the bitmap), so different scenes can use the same 8bpp
+            // bitmap with different ink modes. Caller (Phaser sprite at
+            // composite time) keys on its sprite's ink + the bitmap's
+            // palette[0] background color.
+            img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, a]));
+        }
+    }
+
+    let mut png_bytes: Vec<u8> = Vec::new();
+    if let Err(e) = img.write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png) {
+        return mcp_error(format!("PNG encoding failed: {}", e));
+    }
+    let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+    let head_len = bitmap.data.len().min(64);
+    let data_head_hex = bitmap.data[..head_len]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+
+    // Honor BitmapInfo.center_reg_point: at runtime, Director substitutes
+    // (width/2, height/2) for the stored reg_point when this flag is set
+    // (player/score.rs:4230). Resolve the effective regPoint here so
+    // downstream consumers don't need to know about the flag.
+    let (effective_reg_x, effective_reg_y) = if bitmap_member.info.center_reg_point
+        && bitmap_member.info.width > 0 && bitmap_member.info.height > 0
+    {
+        ((bitmap_member.info.width / 2) as i16, (bitmap_member.info.height / 2) as i16)
+    } else {
+        bitmap_member.reg_point
+    };
+
+    to_json(&McpCastMemberPicture {
+        cast_lib,
+        cast_member,
+        name: member.name.clone(),
+        width,
+        height,
+        bit_depth: bitmap.bit_depth,
+        original_bit_depth: bitmap.original_bit_depth,
+        reg_x: effective_reg_x,
+        reg_y: effective_reg_y,
+        use_alpha: bitmap.use_alpha,
+        palette_ref: format!("{:?}", bitmap.palette_ref),
+        data_len: bitmap.data.len(),
+        data_head_hex,
+        png_base64,
+    })
+}
+
+/// Resolve effective tempo for a 1-based frame.
+/// `tempo_data` is `(frame_idx_zero_based, TempoChannelData)` ascending.
+/// Returns `(duration_ticks, duration_ms)` with default 30 fps when no
+/// tempo entries apply yet.
+fn resolve_film_loop_frame_tempo(
+    tempo_data: &[(u32, crate::director::chunks::score::TempoChannelData)],
+    frame_num_1based: u32,
+) -> (u32, u32) {
+    let mut latest = None;
+    for (frame_idx, td) in tempo_data.iter() {
+        if frame_idx + 1 <= frame_num_1based {
+            latest = Some(td);
+        } else {
+            break;
+        }
+    }
+    let default_fps: u32 = 30;
+    let (ticks, ms) = match latest {
+        // tempo == 246: tempoCuePoint holds FPS (D6+).
+        Some(td) if td.tempo == 246 && td.tempo_cue_point > 0 => {
+            let fps = td.tempo_cue_point as u32;
+            (60u32.checked_div(fps).unwrap_or(2), 1000u32 / fps.max(1))
+        }
+        // tempo == 247: tempoCuePoint holds delay in ticks (1 tick = 1/60 s).
+        Some(td) if td.tempo == 247 && td.tempo_cue_point > 0 => {
+            let ticks = td.tempo_cue_point as u32;
+            (ticks, ticks * 1000 / 60)
+        }
+        // Pre-D6 movies (and some D6+ casts) store FPS directly in the
+        // tempo byte for values 1..=120.
+        Some(td) if td.tempo > 0 && td.tempo <= 120 => {
+            let fps = td.tempo as u32;
+            (60u32.checked_div(fps).unwrap_or(2), 1000u32 / fps.max(1))
+        }
+        _ => (60 / default_fps, 1000 / default_fps),
+    };
+    (ticks, ms)
+}
+
+/// Walk a FilmLoop's score and return per-frame member references + tempo.
+/// FilmLoops in Director are sub-scores with their own sprite channels and
+/// tempo channel. The runtime advances `current_frame` 1..=frame_count and
+/// renders whichever sprites are live in each frame's channels (resolved
+/// via delta encoding over `channel_initialization_data`). This handler
+/// returns the same per-frame resolution as a flat manifest so external
+/// renderers (Furni's Phaser) can play back filmLoops without re-parsing
+/// the cast file.
+pub fn mcp_get_film_loop_frames(
+    player: &DirPlayer,
+    cast_lib: i32,
+    cast_member: i32,
+) -> String {
+    use std::collections::HashMap;
+
+    let cast = match player.movie.cast_manager.get_cast(cast_lib as u32) {
+        Ok(c) => c,
+        Err(_) => return mcp_error(format!("Cast library {} not found", cast_lib)),
+    };
+    let member = match cast.members.get(&(cast_member as u32)) {
+        Some(m) => m,
+        None => return mcp_error(format!(
+            "Cast member {} not found in cast library {}",
+            cast_member, cast_lib
+        )),
+    };
+    let film_loop = match &member.member_type {
+        CastMemberType::FilmLoop(fl) => fl,
+        _ => return mcp_error(format!(
+            "Cast member {}/{} is not a FilmLoop (type: {})",
+            cast_lib,
+            cast_member,
+            member.member_type.type_string()
+        )),
+    };
+
+    // Sort init data defensively by (frame_idx, channel_idx). The reader emits
+    // it in frame-ascending order, but if that ever changes, the delta-merge
+    // below would silently produce wrong frames.
+    let mut init_data: Vec<&(u32, u16, ScoreFrameChannelData)> =
+        film_loop.score.channel_initialization_data.iter().collect();
+    init_data.sort_by_key(|(frame_idx, channel_idx, _)| (*frame_idx, *channel_idx));
+
+    let mut tempo_data: Vec<(u32, crate::director::chunks::score::TempoChannelData)> =
+        film_loop.score.tempo_channel_data.clone();
+    tempo_data.sort_by_key(|(frame_idx, _)| *frame_idx);
+
+    // Determine frame count. Prefer score.frame_count; fall back to the max
+    // frame_idx found across init/tempo/sprite_spans + 1 (since indices are
+    // zero-based but our manifest is 1-based).
+    let max_init_frame = init_data
+        .iter()
+        .map(|(f, _, _)| *f + 1)
+        .max()
+        .unwrap_or(0);
+    let max_tempo_frame = tempo_data.iter().map(|(f, _)| *f + 1).max().unwrap_or(0);
+    let max_span_frame = film_loop
+        .score
+        .sprite_spans
+        .iter()
+        .map(|s| s.end_frame)
+        .max()
+        .unwrap_or(0);
+    let computed_count = max_init_frame
+        .max(max_tempo_frame)
+        .max(max_span_frame)
+        .max(1);
+    let frame_count = film_loop.score.frame_count.unwrap_or(computed_count);
+
+    // For each frame, fold init_data deltas into a per-channel "current member"
+    // map. cast_member==0 is Director's "no change" delta sentinel for member
+    // refs (matches score.rs:910-914 runtime behavior).
+    let mut current_by_channel: HashMap<u16, ScoreFrameChannelData> = HashMap::new();
+    let mut init_cursor: usize = 0;
+
+    let filmloop_cast_lib = cast_lib;
+    let mut frames: Vec<McpFilmLoopFrame> = Vec::with_capacity(frame_count as usize);
+
+    for frame_num in 1..=frame_count {
+        // Advance cursor to absorb all entries with frame_idx + 1 <= frame_num.
+        while init_cursor < init_data.len() {
+            let (frame_idx, channel_idx, data) = init_data[init_cursor];
+            if frame_idx + 1 > frame_num {
+                break;
+            }
+            if data.cast_member != 0 {
+                current_by_channel.insert(*channel_idx, data.clone());
+            }
+            init_cursor += 1;
+        }
+
+        // Emit one entry per active sprite channel (channel_number >= 1).
+        // Sort by channel for deterministic output.
+        let mut active: Vec<(u32, &ScoreFrameChannelData)> = current_by_channel
+            .iter()
+            .filter_map(|(raw_idx, data)| {
+                let channel_number = get_channel_number_from_index(*raw_idx as u32);
+                if channel_number >= 1 && data.cast_member != 0 {
+                    Some((channel_number, data))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        active.sort_by_key(|(ch, _)| *ch);
+
+        let members: Vec<McpFilmLoopFrameMember> = active
+            .into_iter()
+            .map(|(channel, data)| {
+                // Resolve cast_lib: 65535 ("relative to parent cast") and 0
+                // both fall back to the filmloop's own cast (matches
+                // score.rs:920-926 plus the filmloop comment at score.rs:235).
+                let resolved_cast_lib =
+                    if data.cast_lib == 65535 || data.cast_lib == 0 {
+                        filmloop_cast_lib
+                    } else {
+                        data.cast_lib as i32
+                    };
+                let member_ref = CastMemberRef {
+                    cast_lib: resolved_cast_lib,
+                    cast_member: data.cast_member as i32,
+                };
+                let name = player
+                    .movie
+                    .cast_manager
+                    .find_member_by_ref(&member_ref)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                McpFilmLoopFrameMember {
+                    channel,
+                    cast_lib: resolved_cast_lib,
+                    cast_member: data.cast_member as i32,
+                    name,
+                }
+            })
+            .collect();
+
+        let (duration_ticks, duration_ms) =
+            resolve_film_loop_frame_tempo(&tempo_data, frame_num);
+
+        frames.push(McpFilmLoopFrame {
+            frame: frame_num,
+            duration_ticks,
+            duration_ms,
+            members,
+        });
+    }
+
+    let default_duration_ms = frames.first().map(|f| f.duration_ms).unwrap_or(33);
+
+    to_json(&McpFilmLoopFrames {
+        cast_lib,
+        cast_member,
+        name: member.name.clone(),
+        frame_count,
+        width: film_loop.info.width,
+        height: film_loop.info.height,
+        reg_x: film_loop.info.reg_point.0,
+        reg_y: film_loop.info.reg_point.1,
+        loops: film_loop.info.loops != 0,
+        default_duration_ms,
+        frames,
     })
 }
 
