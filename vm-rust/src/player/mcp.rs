@@ -1047,8 +1047,42 @@ pub fn mcp_get_cast_member_picture(
     cast_lib: i32,
     cast_member: i32,
 ) -> String {
+    render_picture_inner(player, cast_lib, cast_member, None)
+}
+
+/// Same as `mcp_get_cast_member_picture` but renders the bitmap using a
+/// substituted palette. Director's "palette cycling" animates indexed bitmaps
+/// by swapping the active CLUT on a timer — pixel data stays the same, only
+/// the index→RGB mapping changes. The dump tool uses this to bake one PNG
+/// per palette frame for any cycling fixture (Tokyo disco floor, London
+/// neon lights, Neptune disco floor, etc.).
+pub fn mcp_get_cast_member_picture_with_palette(
+    player: &DirPlayer,
+    cast_lib: i32,
+    cast_member: i32,
+    palette_cast_lib: i32,
+    palette_cast_member: i32,
+) -> String {
+    let palette_ref = CastMemberRef {
+        cast_lib: palette_cast_lib,
+        cast_member: palette_cast_member,
+    };
+    render_picture_inner(player, cast_lib, cast_member, Some(palette_ref))
+}
+
+/// Shared implementation for the two picture-dump entry points. When
+/// `palette_override` is `Some`, clones the bitmap and overwrites
+/// `palette_ref` before the pixel iter — the rest of the work (force_opaque
+/// rule, PNG encoding, regPoint resolution, response shape) is identical.
+fn render_picture_inner(
+    player: &DirPlayer,
+    cast_lib: i32,
+    cast_member: i32,
+    palette_override: Option<CastMemberRef>,
+) -> String {
     use base64::Engine;
     use image::{ImageFormat, RgbaImage};
+    use crate::player::bitmap::bitmap::PaletteRef;
 
     let cast = match player.movie.cast_manager.get_cast(cast_lib as u32) {
         Ok(c) => c,
@@ -1070,12 +1104,26 @@ pub fn mcp_get_cast_member_picture(
             member.member_type.type_string()
         )),
     };
-    let bitmap = match player.bitmap_manager.get_bitmap(bitmap_member.image_ref) {
+    let bitmap_ref = match player.bitmap_manager.get_bitmap(bitmap_member.image_ref) {
         Some(b) => b,
         None => return mcp_error(format!(
             "Bitmap data for cast member {}/{} not loaded",
             cast_lib, cast_member
         )),
+    };
+
+    // Clone-and-mutate when overriding palette. The clone is per-call (one
+    // per palette frame at dump time), which is acceptable for an offline
+    // tool. `Bitmap` derives Clone (bitmap.rs:130). For the no-override
+    // path we use a borrow to avoid the copy.
+    let owned_bitmap;
+    let bitmap = if let Some(palette_ref) = palette_override {
+        let mut clone = bitmap_ref.clone();
+        clone.palette_ref = PaletteRef::Member(palette_ref);
+        owned_bitmap = clone;
+        &owned_bitmap
+    } else {
+        bitmap_ref
     };
 
     let palettes = player.movie.cast_manager.palettes();

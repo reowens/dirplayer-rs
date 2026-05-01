@@ -21,9 +21,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use fxhash::FxHashMap;
+use vm_rust::player::bitmap::bitmap::PaletteRef;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::{mcp_get_cast_member_picture, mcp_get_film_loop_frames};
+use vm_rust::player::mcp::{
+    mcp_get_cast_member_picture, mcp_get_cast_member_picture_with_palette,
+    mcp_get_film_loop_frames,
+};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -244,11 +248,99 @@ async fn dump_inner() {
                     fs::write(asset_path, &bytes).ok();
                 }
             }
+            // Palette-cycle detection: for indexed bitmaps with a Member
+            // palette, find sibling palettes in the same cast that share the
+            // bitmap's default palette name with a numeric suffix
+            // (`<group>_<n>`). If ≥3 siblings, this is a Director palette-
+            // cycle fixture (Tokyo disco floor, London neon, Neptune disco
+            // floor, secret room marquee, etc.). Render one PNG per palette
+            // frame via mcp_get_cast_member_picture_with_palette and emit a
+            // `paletteFrames` map on the member's metadata for the runtime
+            // cycler to consume.
+            //
+            // Discovery is done in one `reserve_player_ref` to avoid holding
+            // the read-lock during PNG dumping (each MCP call takes its own).
+            let palette_cycle_info: Option<(String, i32, Vec<(i32, i32, i32)>)> =
+                reserve_player_ref(|player| {
+                    let cast = player.movie.cast_manager.get_cast(*cl as u32).ok()?;
+                    let bitmap_member = cast.members.get(&(*cm as u32))?
+                        .member_type.as_bitmap()?;
+                    let bitmap = player.bitmap_manager.get_bitmap(bitmap_member.image_ref)?;
+                    if bitmap.original_bit_depth > 8 { return None; }
+                    let pal_ref = match &bitmap.palette_ref {
+                        PaletteRef::Member(r) => r.clone(),
+                        _ => return None,
+                    };
+                    // Resolve the palette member's name (palettes can live in
+                    // any cast lib — use the ref's own cast_lib).
+                    let pal_cast = player.movie.cast_manager
+                        .get_cast(pal_ref.cast_lib as u32).ok()?;
+                    let pal_member = pal_cast.members.get(&(pal_ref.cast_member as u32))?;
+                    let pal_name = pal_member.name.clone();
+                    if pal_name.is_empty() { return None; }
+                    // Strip trailing `_<digits>` to get group prefix + this
+                    // bitmap's starting frame index.
+                    let (group, default_frame) = match pal_name.rfind('_') {
+                        Some(idx) => {
+                            let suffix = &pal_name[idx + 1..];
+                            let n: i32 = suffix.parse().ok()?;
+                            (pal_name[..idx + 1].to_string(), n)
+                        }
+                        None => return None,
+                    };
+                    // Walk the palette's own cast for siblings matching
+                    // `<group><digits>`.
+                    let mut siblings: Vec<(i32, i32, i32)> = Vec::new();
+                    for (sib_num, sib) in pal_cast.members.iter() {
+                        if sib.member_type.as_palette().is_none() { continue; }
+                        let n = &sib.name;
+                        if !n.starts_with(&group) { continue; }
+                        let suffix = &n[group.len()..];
+                        if let Ok(frame_n) = suffix.parse::<i32>() {
+                            siblings.push((frame_n, pal_ref.cast_lib, *sib_num as i32));
+                        }
+                    }
+                    if siblings.len() < 3 { return None; }
+                    siblings.sort_by_key(|t| t.0);
+                    // Trim trailing `_` for cleaner group label
+                    let group_label = group.trim_end_matches('_').to_string();
+                    Some((group_label, default_frame, siblings))
+                });
+
+            let palette_frames_meta: Option<serde_json::Value> = palette_cycle_info
+                .as_ref()
+                .map(|(group, _default_frame, siblings)| {
+                    // Render one PNG per palette frame and write to the
+                    // assets dir. Filenames are `<file_stem>__pal_<n>.png`.
+                    let mut frames_map = serde_json::Map::new();
+                    for (frame_n, pal_cl, pal_cm) in siblings {
+                        let frame_json = reserve_player_ref(|player| {
+                            mcp_get_cast_member_picture_with_palette(
+                                player, *cl, *cm, *pal_cl, *pal_cm,
+                            )
+                        });
+                        if let Some((bytes, _, _)) = decode_png(&frame_json) {
+                            let fname = format!("{}__pal_{}.png", file_stem, frame_n);
+                            let path = format!("{}/{}", fg_dest_dir, fname);
+                            fs::write(path, &bytes).ok();
+                            frames_map.insert(
+                                frame_n.to_string(),
+                                serde_json::Value::String(fname),
+                            );
+                        }
+                    }
+                    summary.push(format!(
+                        "    palette-cycle: {} → {} frames (group={}, start={})",
+                        emit_name, siblings.len(), group, _default_frame
+                    ));
+                    serde_json::Value::Object(frames_map)
+                });
+
             // Capture metadata regardless of PNG decode success — name lookup
             // and bitmap shape are useful even for empty/zero-byte members.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
                 if !emit_name.is_empty() {
-                    members_meta.push(serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "name": name,
                         "key": emit_name,
                         "filename": format!("{}.png", file_stem),
@@ -261,7 +353,18 @@ async fn dump_inner() {
                         "useAlpha": v.get("use_alpha"),
                         "width": v.get("width"),
                         "height": v.get("height"),
-                    }));
+                    });
+                    if let (Some(frames), Some((group, default_frame, _))) =
+                        (palette_frames_meta, palette_cycle_info.as_ref())
+                    {
+                        let obj = entry.as_object_mut().unwrap();
+                        obj.insert("paletteFrames".into(), frames);
+                        obj.insert("paletteDefaultFrame".into(),
+                                   serde_json::Value::from(*default_frame));
+                        obj.insert("paletteGroup".into(),
+                                   serde_json::Value::String(group.clone()));
+                    }
+                    members_meta.push(entry);
                 }
             }
         }
