@@ -278,16 +278,23 @@ async fn dump_inner() {
                     let pal_member = pal_cast.members.get(&(pal_ref.cast_member as u32))?;
                     let pal_name = pal_member.name.clone();
                     if pal_name.is_empty() { return None; }
-                    // Strip trailing `_<digits>` to get group prefix + this
-                    // bitmap's starting frame index.
-                    let (group, default_frame) = match pal_name.rfind('_') {
-                        Some(idx) => {
-                            let suffix = &pal_name[idx + 1..];
-                            let n: i32 = suffix.parse().ok()?;
-                            (pal_name[..idx + 1].to_string(), n)
-                        }
-                        None => return None,
-                    };
+                    // Strip trailing digits to get group prefix + this
+                    // bitmap's starting frame index. Director's palette
+                    // naming conventions are mixed: some groups use
+                    // `<prefix>_<digit>` (londonlights_0, peaceful_1) and
+                    // others omit the underscore (GoalightPalette0,
+                    // RrLitePal3). Walk back from the end to find the digit
+                    // boundary so both forms detect cleanly.
+                    let digit_start = pal_name
+                        .char_indices()
+                        .rev()
+                        .take_while(|(_, c)| c.is_ascii_digit())
+                        .last()
+                        .map(|(i, _)| i)?;
+                    if digit_start == 0 { return None; }
+                    let group = &pal_name[..digit_start];
+                    let default_frame: i32 = pal_name[digit_start..].parse().ok()?;
+                    let group = group.to_string();
                     // Walk the palette's own cast for siblings matching
                     // `<group><digits>`.
                     let mut siblings: Vec<(i32, i32, i32)> = Vec::new();
@@ -296,13 +303,18 @@ async fn dump_inner() {
                         let n = &sib.name;
                         if !n.starts_with(&group) { continue; }
                         let suffix = &n[group.len()..];
+                        // Suffix must be entirely digits; otherwise we'd
+                        // false-match e.g. group "Goalight" against name
+                        // "GoalightWeird1" (suffix "Weird1").
                         if let Ok(frame_n) = suffix.parse::<i32>() {
                             siblings.push((frame_n, pal_ref.cast_lib, *sib_num as i32));
                         }
                     }
                     if siblings.len() < 3 { return None; }
                     siblings.sort_by_key(|t| t.0);
-                    // Trim trailing `_` for cleaner group label
+                    // Trim trailing `_` for cleaner group label (e.g.
+                    // "londonlights_" → "londonlights"; "GoalightPalette"
+                    // unchanged).
                     let group_label = group.trim_end_matches('_').to_string();
                     Some((group_label, default_frame, siblings))
                 });
