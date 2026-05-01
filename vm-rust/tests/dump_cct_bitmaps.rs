@@ -295,19 +295,68 @@ async fn dump_inner() {
                     let group = &pal_name[..digit_start];
                     let default_frame: i32 = pal_name[digit_start..].parse().ok()?;
                     let group = group.to_string();
-                    // Walk the palette's own cast for siblings matching
-                    // `<group><digits>`.
-                    let mut siblings: Vec<(i32, i32, i32)> = Vec::new();
-                    for (sib_num, sib) in pal_cast.members.iter() {
-                        if sib.member_type.as_palette().is_none() { continue; }
-                        let n = &sib.name;
-                        if !n.starts_with(&group) { continue; }
-                        let suffix = &n[group.len()..];
-                        // Suffix must be entirely digits; otherwise we'd
-                        // false-match e.g. group "Goalight" against name
-                        // "GoalightWeird1" (suffix "Weird1").
-                        if let Ok(frame_n) = suffix.parse::<i32>() {
-                            siblings.push((frame_n, pal_ref.cast_lib, *sib_num as i32));
+                    // Helper: collect palette siblings matching `<g><digits>`.
+                    let collect = |g: &str| -> Vec<(i32, i32, i32)> {
+                        let mut out: Vec<(i32, i32, i32)> = Vec::new();
+                        for (sib_num, sib) in pal_cast.members.iter() {
+                            if sib.member_type.as_palette().is_none() { continue; }
+                            let n = &sib.name;
+                            if !n.starts_with(g) { continue; }
+                            let suffix = &n[g.len()..];
+                            // Suffix must be entirely digits; otherwise we'd
+                            // false-match e.g. group "Goalight" against name
+                            // "GoalightWeird1" (suffix "Weird1").
+                            if let Ok(frame_n) = suffix.parse::<i32>() {
+                                out.push((frame_n, pal_ref.cast_lib, *sib_num as i32));
+                            }
+                        }
+                        out
+                    };
+                    let mut siblings = collect(&group);
+                    let mut chosen_group = group.clone();
+                    let mut chosen_default_frame = default_frame;
+                    if siblings.len() < 3 {
+                        // Cousin-group fallback for room-specific PaletteAnimator
+                        // subclasses that store the bitmap's idle palette in a
+                        // single-frame group (e.g. `neptune_discofloor_peaceful_0`)
+                        // but cycle through a sibling group during performance
+                        // (`neptune_discofloor_action_0..21`).
+                        // NeptuneFloorAnimator (Cast External BehaviorScript 50,
+                        // atlantis cct) keys this off `aPatternNames` —
+                        // we approximate it by walking back one `_` segment to
+                        // get a parent prefix and finding the largest cousin
+                        // group with ≥ 3 frames. Tokyo's primary group already
+                        // has 16 frames so this fallback never fires for it.
+                        let trimmed = group.trim_end_matches('_');
+                        if let Some(last_us) = trimmed.rfind('_') {
+                            let parent_prefix = &trimmed[..=last_us]; // includes trailing `_`
+                            let mut cousin_groups: HashMap<String, Vec<(i32, i32, i32)>> = HashMap::new();
+                            for (sib_num, sib) in pal_cast.members.iter() {
+                                if sib.member_type.as_palette().is_none() { continue; }
+                                let n = &sib.name;
+                                if !n.starts_with(parent_prefix) { continue; }
+                                let rest = &n[parent_prefix.len()..];
+                                // rest = "action_5", "peaceful_0", etc.
+                                if let Some(us) = rest.rfind('_') {
+                                    if let Ok(frame_n) = rest[us+1..].parse::<i32>() {
+                                        let cg = format!("{}{}_", parent_prefix, &rest[..us]);
+                                        cousin_groups
+                                            .entry(cg)
+                                            .or_default()
+                                            .push((frame_n, pal_ref.cast_lib, *sib_num as i32));
+                                    }
+                                }
+                            }
+                            if let Some((best_g, best_sibs)) = cousin_groups
+                                .into_iter()
+                                .filter(|(g, sibs)| g != &group && sibs.len() >= 3)
+                                .max_by_key(|(_, sibs)| sibs.len())
+                            {
+                                chosen_group = best_g;
+                                siblings = best_sibs;
+                                siblings.sort_by_key(|t| t.0);
+                                chosen_default_frame = siblings[0].0;
+                            }
                         }
                     }
                     if siblings.len() < 3 { return None; }
@@ -315,8 +364,8 @@ async fn dump_inner() {
                     // Trim trailing `_` for cleaner group label (e.g.
                     // "londonlights_" → "londonlights"; "GoalightPalette"
                     // unchanged).
-                    let group_label = group.trim_end_matches('_').to_string();
-                    Some((group_label, default_frame, siblings))
+                    let group_label = chosen_group.trim_end_matches('_').to_string();
+                    Some((group_label, chosen_default_frame, siblings))
                 });
 
             let palette_frames_meta: Option<serde_json::Value> = palette_cycle_info
