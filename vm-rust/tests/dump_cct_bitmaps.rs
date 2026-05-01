@@ -201,31 +201,63 @@ async fn dump_inner() {
         let fg_dest_dir = format!("{}/{}", FURNI_ASSETS, room_id);
         fs::create_dir_all(&fg_dest_dir).ok();
         let mut members_meta: Vec<serde_json::Value> = Vec::new();
+        // Track which <name>.png filenames we've already written in this
+        // room to detect cast-member name collisions. When two cast members
+        // share a name (rio has two `rio_wave1` at 183x93 and 205x106; rays
+        // has multiple `car_256` variants used by different filmLoops), the
+        // second write would silently overwrite the first. We disambiguate
+        // by writing the second+ as `<name>__cast<castLib>_<castMember>.png`
+        // and emit a separate _members.json entry whose key is the matching
+        // composite. Translator + runtime use the composite key when a
+        // filmLoop manifest specifies (cast_lib, cast_member) for that
+        // child, so the right variant is rendered.
+        let mut taken_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (cl, cm, name) in &targets {
             let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
+            // Determine emit name + filename. First occurrence keeps the
+            // bare name (matches Director's first-match name-lookup
+            // semantics for canonical.roomBitmaps / canonical.staticItems
+            // references which carry only a name). Collisions get a
+            // `<name>#cl_cm` composite key and `<name>__castCL_CM.png`
+            // file.
+            let (emit_name, file_stem): (String, String) = if name.is_empty() {
+                (String::new(), format!("__cast{}_{}", cl, cm))
+            } else if taken_names.insert(name.clone()) {
+                (name.clone(), name.clone())
+            } else {
+                (
+                    format!("{}#{}_{}", name, cl, cm),
+                    format!("{}__cast{}_{}", name, cl, cm),
+                )
+            };
+            let safe = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                .collect::<String>();
             if let Some((bytes, _, _)) = decode_png(&json) {
-                let safe = name
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-                    .collect::<String>();
-                let out = room_dump_dir.join(format!("{}_{}_{}.png", cl, cm, safe));
-                fs::write(out, &bytes).ok();
-                // Also write under exact member name so translator-emitted
-                // staticObjects can reference it.
-                if !name.is_empty() {
-                    let asset_path = format!("{}/{}.png", fg_dest_dir, name);
+                // Per-room scratch dir (always disambiguated by cast pair).
+                let scratch = room_dump_dir.join(format!("{}_{}_{}.png", cl, cm, safe));
+                fs::write(scratch, &bytes).ok();
+                // Furni assets dir (canonical PNG, possibly disambiguated).
+                if !file_stem.is_empty() {
+                    let asset_path = format!("{}/{}.png", fg_dest_dir, file_stem);
                     fs::write(asset_path, &bytes).ok();
                 }
             }
             // Capture metadata regardless of PNG decode success — name lookup
             // and bitmap shape are useful even for empty/zero-byte members.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-                if !name.is_empty() {
+                if !emit_name.is_empty() {
                     members_meta.push(serde_json::json!({
                         "name": name,
+                        "key": emit_name,
+                        "filename": format!("{}.png", file_stem),
+                        "castLib": cl,
+                        "castMember": cm,
                         "regX": v.get("reg_x"),
                         "regY": v.get("reg_y"),
                         "bitDepth": v.get("bit_depth"),
+                        "originalBitDepth": v.get("original_bit_depth"),
                         "useAlpha": v.get("use_alpha"),
                         "width": v.get("width"),
                         "height": v.get("height"),
