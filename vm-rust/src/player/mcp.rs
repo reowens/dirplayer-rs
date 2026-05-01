@@ -1507,6 +1507,18 @@ pub fn mcp_get_film_loop_frames(
         })
         .collect();
 
+    // Director filmLoops ALWAYS use center registration regardless of the
+    // stored info.reg_point and info.center flag — score.rs:4392 hardcodes
+    // `reg_x = width/2, reg_y = height/2` for filmLoop sprites. The stored
+    // reg_point is effectively dead data for filmLoops; if we ship it
+    // verbatim, downstream renderers anchor the filmLoop at its top-left
+    // and every child sprite ends up offset by half the filmLoop's size.
+    let (reg_x, reg_y) = if film_loop.info.width > 0 && film_loop.info.height > 0 {
+        ((film_loop.info.width / 2) as i16, (film_loop.info.height / 2) as i16)
+    } else {
+        film_loop.info.reg_point
+    };
+
     to_json(&McpFilmLoopFrames {
         cast_lib,
         cast_member,
@@ -1514,8 +1526,8 @@ pub fn mcp_get_film_loop_frames(
         frame_count,
         width: film_loop.info.width,
         height: film_loop.info.height,
-        reg_x: film_loop.info.reg_point.0,
-        reg_y: film_loop.info.reg_point.1,
+        reg_x,
+        reg_y,
         loops: film_loop.info.loops != 0,
         default_duration_ms,
         sprite_spans,
