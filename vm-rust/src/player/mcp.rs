@@ -1415,8 +1415,14 @@ pub fn mcp_get_film_loop_frames(
 
             // Start from the delta-merged init values, then let
             // keyframes_cache override per-frame transforms.
-            let mut loc_h = data.pos_x as i32;
-            let mut loc_v = data.pos_y as i32;
+            // pos_x/pos_y are in source filmLoop coords; subtract
+            // initial_rect.left/top so emitted loc_h/loc_v are in
+            // filmloop_bitmap-local coords (matches the offset
+            // render_score_to_bitmap_with_offset applies at
+            // rendering.rs:2225). Downstream renderers can place
+            // children directly without re-applying the offset.
+            let mut loc_h = data.pos_x as i32 - film_loop.initial_rect.left;
+            let mut loc_v = data.pos_y as i32 - film_loop.initial_rect.top;
             let mut width = data.width as i32;
             let mut height = data.height as i32;
             let mut rotation = data.rotation;
@@ -1426,8 +1432,10 @@ pub fn mcp_get_film_loop_frames(
             if let Some(kf) = film_loop.score.keyframes_cache.get(&(span.channel as u16)) {
                 if let Some(path) = kf.path.as_ref() {
                     if let Some((x, y)) = path.get_position_at_frame(frame_num) {
-                        loc_h = x as i32;
-                        loc_v = y as i32;
+                        // Same offset normalization as the delta-merged
+                        // pos above — keep emitted loc in bitmap-local space.
+                        loc_h = x as i32 - film_loop.initial_rect.left;
+                        loc_v = y as i32 - film_loop.initial_rect.top;
                     }
                 }
                 if let Some(size_kf) = kf.size.as_ref() {
@@ -1507,25 +1515,31 @@ pub fn mcp_get_film_loop_frames(
         })
         .collect();
 
-    // Director filmLoops ALWAYS use center registration regardless of the
-    // stored info.reg_point and info.center flag — score.rs:4392 hardcodes
-    // `reg_x = width/2, reg_y = height/2` for filmLoop sprites. The stored
-    // reg_point is effectively dead data for filmLoops; if we ship it
-    // verbatim, downstream renderers anchor the filmLoop at its top-left
-    // and every child sprite ends up offset by half the filmLoop's size.
-    let (reg_x, reg_y) = if film_loop.info.width > 0 && film_loop.info.height > 0 {
-        ((film_loop.info.width / 2) as i16, (film_loop.info.height / 2) as i16)
-    } else {
-        film_loop.info.reg_point
-    };
+    // Manifest dimensions come from `initial_rect` (the bounding box of all
+    // child sprites across all frames) — that's what Director uses as the
+    // filmloop_bitmap natural size and the on-stage rendering size, NOT
+    // the FilmLoopInfo's stored width/height. See cast_member.rs:768
+    // `compute_filmloop_initial_rect` and rendering.rs:2188-2189
+    // (`let width = initial_rect.width()`).
+    //
+    // Director filmLoops ALWAYS use center registration: the loc_h/loc_v
+    // anchor on the parent .room sprite is treated as the filmLoop's
+    // CENTER (score.rs:4392-4394 hardcodes `reg_x = use_width/2`). With
+    // bitmap-local child loc_h/loc_v (offset-normalized above) and a
+    // centered regPoint, downstream renderers can place each child as
+    // `(parent_loc - reg + child_loc - child_reg)`.
+    let nat_width = film_loop.initial_rect.width().max(1) as u16;
+    let nat_height = film_loop.initial_rect.height().max(1) as u16;
+    let reg_x = (nat_width / 2) as i16;
+    let reg_y = (nat_height / 2) as i16;
 
     to_json(&McpFilmLoopFrames {
         cast_lib,
         cast_member,
         name: member.name.clone(),
         frame_count,
-        width: film_loop.info.width,
-        height: film_loop.info.height,
+        width: nat_width,
+        height: nat_height,
         reg_x,
         reg_y,
         loops: film_loop.info.loops != 0,
