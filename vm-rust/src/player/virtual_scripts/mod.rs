@@ -319,5 +319,8 @@ impl VirtualScriptRegistry {
 
 /// Register all built-in virtual scripts.
 pub fn register_virtual_scripts(player: &mut DirPlayer) {
+    if player.movie.cast_manager.casts.is_empty() {
+        return;
+    }
     VirtualScriptRegistry::register(player, "JavaScriptProxy", Rc::new(javascript_proxy::JavascriptProxy));
 }

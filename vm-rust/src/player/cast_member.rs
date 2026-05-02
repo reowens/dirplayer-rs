@@ -1134,6 +1134,7 @@ impl CastMember {
         let payload = &raw[flsh_start + 8..];
         let vector_member = Self::parse_flsh_payload(payload);
 
+        #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(
             &format!(
                 "OLE member #{} identified as vectorShape: {} vertices, strokeWidth={}, fillMode={}, closed={}, bbox=({},{},{},{})",
@@ -1280,20 +1281,23 @@ impl CastMember {
             bbox_bottom = 0.0;
         }
 
-        web_sys::console::log_1(
-            &format!(
-                "  FLSH parsed: stroke=({},{},{}), strokeW={}, fillMode={}, closed={}, verts={}",
-                stroke_color.0, stroke_color.1, stroke_color.2,
-                stroke_width, fill_mode, closed, vertices.len(),
-            ).into(),
-        );
-        for (i, v) in vertices.iter().enumerate() {
+        #[cfg(target_arch = "wasm32")]
+        {
             web_sys::console::log_1(
                 &format!(
-                    "  vertex[{}]: ({}, {}) h1=({}, {}) h2=({}, {})",
-                    i, v.x, v.y, v.handle1_x, v.handle1_y, v.handle2_x, v.handle2_y,
+                    "  FLSH parsed: stroke=({},{},{}), strokeW={}, fillMode={}, closed={}, verts={}",
+                    stroke_color.0, stroke_color.1, stroke_color.2,
+                    stroke_width, fill_mode, closed, vertices.len(),
                 ).into(),
             );
+            for (i, v) in vertices.iter().enumerate() {
+                web_sys::console::log_1(
+                    &format!(
+                        "  vertex[{}]: ({}, {}) h1=({}, {}) h2=({}, {})",
+                        i, v.x, v.y, v.handle1_x, v.handle1_y, v.handle2_x, v.handle2_y,
+                    ).into(),
+                );
+            }
         }
 
         VectorShapeMember {
@@ -1924,6 +1928,7 @@ impl CastMember {
                         name: member_info.name.clone(),
                     })
                 } else {
+                    #[cfg(target_arch = "wasm32")]
                     web_sys::console::warn_1(&format!("Script member {}: script_id {} not found in Lctx, skipping", number, script_id).into());
                     CastMemberType::Unknown
                 }

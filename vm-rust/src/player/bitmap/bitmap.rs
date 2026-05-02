@@ -46,6 +46,7 @@ impl PaletteRef {
             match BuiltInPalette::from_i16(i) {
                 Some(palette) => PaletteRef::BuiltIn(palette),
                 None => {
+                    #[cfg(target_arch = "wasm32")]
                     web_sys::console::warn_1(
                         &format!("Unknown built-in palette ID: {}, defaulting to SystemWin", i).into()
                     );
@@ -806,6 +807,7 @@ pub fn decompress_bitmap(
 
                         // Check bounds
                         if line_offset + x + 3 * scan_width as usize >= result.len() {
+                            #[cfg(target_arch = "wasm32")]
                             web_sys::console::warn_1(&format!(
                                 "32-bit decode: Out of bounds access at y={}, x={}. line_offset={}, result.len()={}",
                                 y, x, line_offset, result.len()
