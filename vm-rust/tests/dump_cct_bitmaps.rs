@@ -32,8 +32,21 @@ use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
 
-const CASTS_ROOT: &str = "/Users/reoiv/Development/sandbox/decibel/upstream/cokemusic-casts/client2/publicrooms";
-const FURNI_ASSETS: &str = "/Users/reoiv/Development/sandbox/decibel/packages/client/public/assets/rooms";
+/// Input cct mirror — set CASTS_ROOT to the directory containing client2/ contents
+/// (must contain a `publicrooms/` subdir with the per-room .cct files).
+fn casts_root() -> String {
+    std::env::var("CASTS_ROOT").unwrap_or_else(|_| "./casts".to_string())
+}
+fn publicrooms_dir() -> String {
+    format!("{}/publicrooms", casts_root())
+}
+/// Output root for the rendered PNGs + _members.json sidecars.
+fn output_root() -> String {
+    std::env::var("OUTPUT_ROOT").unwrap_or_else(|_| "./out".to_string())
+}
+fn rooms_output_dir() -> String {
+    format!("{}/rooms", output_root())
+}
 const PER_ROOM_DUMP_ROOT: &str = "/tmp/dirplayer_dumps";
 
 /// (cct basename, furni room id, bg cast member name) — bg name comes from
@@ -44,6 +57,7 @@ fn room_mapping() -> Vec<(&'static str, &'static str, &'static str)> {
         ("alaska",            "alaska",            "reykjavik_bg"),
         ("atlantis",          "neptune",           "atlantis_background"),
         ("auditiongold",      "audition_gold",     "audition_gold_8_bit"),
+        ("auditionred",       "casting_call_red",  "audition_red_8_bit"),
         ("castingcallroom",   "casting_call_blue", "casting-call-room-bg"),
         ("centralpark",       "central_park",      "backgroundflatspeakerwire"),
         ("clubcherry",        "club_cherry",       "cherry_v12_15-bit_"),
@@ -72,7 +86,7 @@ fn dump_publicroom_cct_bitmaps() {
 }
 
 async fn dump_inner() {
-    fs::create_dir_all(FURNI_ASSETS).expect("create assets dir");
+    fs::create_dir_all(rooms_output_dir()).expect("create assets dir");
     fs::create_dir_all(PER_ROOM_DUMP_ROOT).expect("create dump root");
 
     // Single TestPlayer reused across all loads — load_movie just replaces
@@ -86,7 +100,7 @@ async fn dump_inner() {
 
     let rooms = room_mapping();
     for (cct_base, room_id, bg_name_override) in &rooms {
-        let cct_path = format!("{}/{}.cct", CASTS_ROOT, cct_base);
+        let cct_path = format!("{}/{}.cct", publicrooms_dir(), cct_base);
         if !PathBuf::from(&cct_path).exists() {
             summary.push(format!("  ✗ {} → {}: cct not found at {}", cct_base, room_id, cct_path));
             continue;
@@ -167,12 +181,22 @@ async fn dump_inner() {
                 }
             }
         });
+        // `cast.members` is a HashMap so iteration order is non-deterministic.
+        // The collision-disambiguation logic below assigns the BARE name to
+        // whichever (cl, cm) is processed first — Director's first-match
+        // cast lookup uses the LOWEST cast-member-number occurrence, so we
+        // sort the same way before processing. Without this sort, e.g.
+        // red_room's `redroomsofa2_a_0_1_1_2_0` would non-deterministically
+        // give the bare PNG to either the cm=9 sprite (40×46 real sofa) or
+        // the cm=17 sprite (2×1 placeholder). We want the lowest cm to win.
+        targets.sort_by_key(|(cl, cm, _)| (*cl, *cm));
+        film_loop_targets.sort_by_key(|(cl, cm, _)| (*cl, *cm));
 
         // Dump the bg specifically into Furni assets dir.
         if let Some((cl, cm, name)) = &bg_target {
             let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
             if let Some((bytes, w, h)) = decode_png(&json) {
-                let out = format!("{}/{}.png", FURNI_ASSETS, room_id);
+                let out = format!("{}/{}.png", rooms_output_dir(), room_id);
                 fs::write(&out, &bytes).expect("write bg png");
                 summary.push(format!(
                     "  ✓ {:<22} → {:<22} bg {} {}x{} ({} bytes)",
@@ -202,7 +226,7 @@ async fn dump_inner() {
         // width/height, use_alpha) into a per-room `_members.json` file so
         // the Furni translator can emit `canonical.members` for runtime
         // anchor + ink-mode decisions.
-        let fg_dest_dir = format!("{}/{}", FURNI_ASSETS, room_id);
+        let fg_dest_dir = format!("{}/{}", rooms_output_dir(), room_id);
         fs::create_dir_all(&fg_dest_dir).ok();
         let mut members_meta: Vec<serde_json::Value> = Vec::new();
         // Track which <name>.png filenames we've already written in this
@@ -492,31 +516,6 @@ async fn dump_inner() {
         }
     }
 
-    // After processing the table, also handle the casting_call_red alias —
-    // same cct as casting_call_blue.
-    if PathBuf::from(format!("{}/castingcallroom.cct", CASTS_ROOT)).exists() {
-        let src = format!("{}/casting_call_blue.png", FURNI_ASSETS);
-        let dst = format!("{}/casting_call_red.png", FURNI_ASSETS);
-        if PathBuf::from(&src).exists() {
-            fs::copy(&src, &dst).ok();
-            summary.push(format!("  ✓ casting_call_blue.png → casting_call_red.png (alias)"));
-        }
-        // Also copy the per-room asset dir + _members.json for the alias.
-        let blue_dir = PathBuf::from(format!("{}/casting_call_blue", FURNI_ASSETS));
-        let red_dir = PathBuf::from(format!("{}/casting_call_red", FURNI_ASSETS));
-        if blue_dir.is_dir() {
-            fs::create_dir_all(&red_dir).ok();
-            if let Ok(entries) = fs::read_dir(&blue_dir) {
-                for entry in entries.flatten() {
-                    let from = entry.path();
-                    let to = red_dir.join(entry.file_name());
-                    fs::copy(&from, &to).ok();
-                }
-            }
-            summary.push(format!("  ✓ casting_call_blue/* → casting_call_red/* (alias)"));
-        }
-    }
-
     println!();
     println!("=== Bg extraction summary ({} rooms) ===", rooms.len());
     for line in &summary {
@@ -555,16 +554,24 @@ fn extract_num(json: &str, key: &str) -> Option<u64> {
     rest[..end].parse::<u64>().ok()
 }
 
-/// Read each Furni room's canonical.roomBitmaps[].member names (excluding
-/// id="floor") so we know which FG cast members to dump for that room.
+/// Optionally read a downstream consumer's per-room JSON to learn which FG
+/// cast members are referenced by `canonical.roomBitmaps` (excluding
+/// id="floor"). Used to limit per-room output to relevant members.
+///
+/// Set `ROOM_JSON_DIR` to point at a directory of `<room_id>.json` files
+/// matching the schema this dumper consumes (see SCHEMA.md). If unset, the
+/// filter is skipped and every FG bitmap in each cct is dumped.
 fn read_canonical_fg_members() -> HashMap<String, Vec<String>> {
     use std::path::Path;
     let mut out = HashMap::new();
-    let rooms_dir = "/Users/reoiv/Development/sandbox/decibel/packages/common/src/data/rooms";
-    if !Path::new(rooms_dir).exists() {
+    let rooms_dir = match std::env::var("ROOM_JSON_DIR") {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    if !Path::new(&rooms_dir).exists() {
         return out;
     }
-    for entry in fs::read_dir(rooms_dir).unwrap_or_else(|_| panic!("read {}", rooms_dir)).flatten() {
+    for entry in fs::read_dir(&rooms_dir).unwrap_or_else(|_| panic!("read {}", rooms_dir)).flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
         let stem = match path.file_stem().and_then(|s| s.to_str()) { Some(s) => s.to_string(), None => continue };
