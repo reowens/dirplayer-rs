@@ -138,7 +138,7 @@ export default function LoadMovie() {
   }, []);
 
   useMountEffect(async () => {
-    if (movieUrl && process.env.REACT_APP_MOVIE_AUTO_LOAD === 'true' && !isDebugSession()) {
+    if (movieUrl && process.env.REACT_APP_MOVIE_AUTO_LOAD === 'true') {
       await loadMovieFile(movieUrl);
     }
   });

@@ -232,6 +232,30 @@ export const mcpTools: McpTool[] = [
       required: ['cast_lib', 'cast_member']
     }
   },
+  {
+    name: 'get_cast_member_picture',
+    description: 'Render a Bitmap cast member to PNG (palette-resolved RGBA) and return as base64. Returns {cast_lib, cast_member, name, width, height, bit_depth, original_bit_depth, reg_x, reg_y, use_alpha, palette_ref, png_base64}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cast_lib: { type: 'number', description: 'Cast library number' },
+        cast_member: { type: 'number', description: 'Cast member number' }
+      },
+      required: ['cast_lib', 'cast_member']
+    }
+  },
+  {
+    name: 'load_movie',
+    description: 'Load a Director movie (.dir/.dcr/.cct) by URL into the player. Returns {status: "loaded"} when complete.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Absolute URL to the movie file (e.g. http://127.0.0.1:8765/cc_studio.cct)' },
+        autoplay: { type: 'boolean', description: 'Whether to start playback after load (default true)' }
+      },
+      required: ['url']
+    }
+  },
 
   // Breakpoint tools
   {
@@ -293,6 +317,8 @@ export type McpToolName =
   | 'list_cast_libs'
   | 'list_cast_members'
   | 'inspect_cast_member'
+  | 'get_cast_member_picture'
+  | 'load_movie'
   | 'set_breakpoint'
   | 'remove_breakpoint'
   | 'list_breakpoints';

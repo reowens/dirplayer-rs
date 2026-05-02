@@ -273,6 +273,27 @@ export class McpServer {
           args.cast_member as number
         );
 
+      case 'get_cast_member_picture':
+        return this.wasm.mcp_get_cast_member_picture(
+          args.cast_lib as number,
+          args.cast_member as number
+        );
+
+      case 'load_movie': {
+        const url = args.url as string;
+        const autoplay = args.autoplay !== false;
+        // Mirror LoadMovie/index.tsx flow exactly: set_base_path → set_external_params → load_movie_file.
+        const basePath = url.split('/').slice(0, -1).join('/');
+        if (typeof this.wasm.set_base_path === 'function') {
+          this.wasm.set_base_path(basePath);
+        }
+        if (typeof this.wasm.set_external_params === 'function') {
+          this.wasm.set_external_params({});
+        }
+        await this.wasm.load_movie_file(url, autoplay);
+        return JSON.stringify({ status: 'load dispatched', url, autoplay, base_path: basePath });
+      }
+
       // Breakpoint tools
       case 'set_breakpoint':
         this.wasm.add_breakpoint(
@@ -349,6 +370,11 @@ export function getMcpUrl(): string {
 }
 
 export function isMcpEnabled(): boolean {
+  // Override for asset-extraction harness: REACT_APP_MCP_FORCE_ENABLED=true
+  // forces MCP on even when localStorage hasn't been seeded.
+  if (typeof process !== 'undefined' && process.env?.REACT_APP_MCP_FORCE_ENABLED === 'true') {
+    return true;
+  }
   return window.localStorage.getItem(MCP_ENABLED_KEY) === 'true';
 }
 
