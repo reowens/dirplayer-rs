@@ -88,6 +88,63 @@ fn studio_mapping() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Build `studio_registry_id → [member_name, ...]` from each private-type
+/// room JSON's `canonical.members` keys. Set ROOM_JSON_DIR to point at
+/// `packages/common/src/data/rooms/`. If unset, returns empty (per-room
+/// dump pass becomes a no-op).
+///
+/// Studio member names are SHARED across studios (e.g. `wall_corner_1_a_0_3_0`
+/// appears in all 9), so the same physical PNG content gets written to
+/// multiple studio dirs. That's intentional: matches the publicroom
+/// `rooms/<room_id>/<member>.png` LoadingScene path so no runtime change
+/// is needed.
+///
+/// JSON-stem → registry-id map mirrors `packages/common/src/data/rooms/index.ts`
+/// (`studio_a.json` → `studio_model_a`, `star_suite.json` → `studio_star_suite`,
+/// etc.). If a future studio JSON adds a new ID, both this map and the
+/// index registry need updating.
+fn read_canonical_studio_members() -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::HashMap;
+    use std::path::Path;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let rooms_dir = match std::env::var("ROOM_JSON_DIR") {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    if !Path::new(&rooms_dir).exists() {
+        return out;
+    }
+    for entry in fs::read_dir(&rooms_dir).unwrap_or_else(|_| panic!("read {}", rooms_dir)).flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) { Some(s) => s.to_string(), None => continue };
+        let txt = match fs::read_to_string(&path) { Ok(t) => t, Err(_) => continue };
+        let v: serde_json::Value = match serde_json::from_str(&txt) { Ok(v) => v, Err(_) => continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("private") { continue; }
+        let members = match v.pointer("/canonical/members").and_then(|m| m.as_object()) {
+            Some(obj) => obj,
+            None => continue,
+        };
+        let registry_id = match stem.as_str() {
+            "studio_a" => "studio_model_a",
+            "studio_b" => "studio_model_b",
+            "studio_c" => "studio_model_c",
+            "studio_d" => "studio_model_d",
+            "studio_e" => "studio_model_e",
+            "studio_f" => "studio_model_f",
+            "studio_g" => "studio_model_g",
+            "star_suite" => "studio_star_suite",
+            "personal_suite" => "studio_personal_suite",
+            _ => continue,
+        };
+        let names: Vec<String> = members.keys().cloned().collect();
+        if !names.is_empty() {
+            out.insert(registry_id.to_string(), names);
+        }
+    }
+    out
+}
+
 #[test]
 fn dump_studio_cct_bitmaps() {
     async_std::task::block_on(dump_inner());
@@ -242,6 +299,71 @@ async fn dump_inner() {
         ));
     }
 
+    // Per-room member dump: write each studio's `canonical.members` PNGs
+    // into `<rooms_output_dir>/<registry_id>/<member>.png`, matching the
+    // publicroom dump pattern so LoadingScene's `rooms/${roomId}/${file}`
+    // resolves without a runtime change. Sourced from each studio JSON's
+    // `canonical.members` keys (sorted in Step 1 above).
+    let canonical_members_by_studio = read_canonical_studio_members();
+    if !canonical_members_by_studio.is_empty() {
+        // Loud failure if a studio JSON is missing or misnamed in the
+        // stem→registry map. studio_mapping() has 9 entries; if we read
+        // ROOM_JSON_DIR successfully we expect 9 studios.
+        assert!(
+            canonical_members_by_studio.len() == 9,
+            "expected 9 studio JSONs in ROOM_JSON_DIR, got {} — check stem→registry map in read_canonical_studio_members()",
+            canonical_members_by_studio.len()
+        );
+    }
+    let mut per_room_summary: Vec<String> = Vec::new();
+    let mut total_per_room_writes: usize = 0;
+    let mut total_per_room_misses: usize = 0;
+
+    // Stable iteration: sort by registry id so the summary lines are
+    // deterministic across runs (HashMap iteration is not ordered).
+    let mut sorted_studios: Vec<(&String, &Vec<String>)> = canonical_members_by_studio.iter().collect();
+    sorted_studios.sort_by(|a, b| a.0.cmp(b.0));
+    for (registry_id, member_names) in sorted_studios {
+        let dest_dir = format!("{}/{}", rooms_output_dir(), registry_id);
+        fs::create_dir_all(&dest_dir).expect("create per-studio assets dir");
+
+        let mut dir_writes: usize = 0;
+        let mut dir_misses: Vec<String> = Vec::new();
+        for member_name in member_names {
+            let Some(&(cl, cm)) = name_to_id.get(member_name) else {
+                dir_misses.push(member_name.clone());
+                continue;
+            };
+            let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, cl, cm));
+            let Some((bytes, _w, _h)) = decode_png(&json) else {
+                dir_misses.push(format!("{} (png decode failed)", member_name));
+                continue;
+            };
+            let out = format!("{}/{}.png", dest_dir, member_name);
+            fs::write(&out, &bytes).expect("write per-studio member png");
+            dir_writes += 1;
+        }
+        total_per_room_writes += dir_writes;
+        total_per_room_misses += dir_misses.len();
+        per_room_summary.push(format!(
+            "  ✓ {:<25} {} PNGs → {} (misses: {})",
+            registry_id,
+            dir_writes,
+            dest_dir,
+            if dir_misses.is_empty() { "none".to_string() } else { dir_misses.join(", ") },
+        ));
+    }
+
+    if !canonical_members_by_studio.is_empty() {
+        summary.push(format!(
+            "  per-room member dump: {} studios, {} PNGs written, {} misses",
+            canonical_members_by_studio.len(),
+            total_per_room_writes,
+            total_per_room_misses,
+        ));
+        summary.extend(per_room_summary);
+    }
+
     // Sidecar manifest. The Furni-side translator that promotes wiki
     // bgs to cast-extracted bgs reads this to compute correct
     // xAnchor/yAnchor + sanity-check expected dimensions.
@@ -323,6 +445,19 @@ async fn dump_inner() {
     println!("=== Studio bg extraction summary ===");
     for line in &summary {
         println!("{}", line);
+    }
+
+    // Strict mode for the per-room member dump only: if any
+    // canonical.members reference doesn't resolve to a cast member in
+    // cc_studio.cct, fail the test loudly. The studio_mapping bg dump
+    // above can still log `✗` lines silently — those misses are tolerated
+    // (e.g. studio_e/f/g were dumpable before any Furni JSON existed).
+    if total_per_room_misses > 0 {
+        panic!(
+            "studio per-room member dump: {} misses across {} studios — see summary above",
+            total_per_room_misses,
+            canonical_members_by_studio.len()
+        );
     }
 }
 
