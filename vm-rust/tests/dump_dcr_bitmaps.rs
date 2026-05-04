@@ -78,6 +78,21 @@ fn recycler_output_dir() -> String {
 /// Matches `dump_cct_bitmaps.rs`'s `PER_ROOM_DUMP_ROOT` convention.
 const SCRATCH_DUMP_ROOT: &str = "/tmp/dirplayer_dumps/recycler";
 
+/// Per-sound metadata captured during enumeration. WAV bytes are
+/// computed inline so the dump-time loop doesn't need a second
+/// player borrow.
+struct SoundTarget {
+    cast_lib: i32,
+    cast_member: i32,
+    name: String,
+    wav_bytes: Vec<u8>,
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    sample_count: u32,
+    codec: String,
+}
+
 /// The single member name we use to gate Phase 0. The DCR's actual
 /// background bitmap is named `bg` (Lingo `Background` is a Director
 /// channel-zero pun, not a cast-member name). At 760×521 it matches
@@ -178,13 +193,19 @@ async fn dump_inner() {
         }
     });
 
-    // === Enumerate bitmap targets ===
+    // === Enumerate bitmap + sound targets ===
+    // Sound targets carry the WAV bytes inline (extracted now to avoid a
+    // second player.cast_manager walk during the dump section). The
+    // bitmap pipeline still defers PNG generation to the per-target loop
+    // because mcp_get_cast_member_picture takes its own player ref.
     let mut targets: Vec<(i32, i32, String)> = Vec::new();
+    let mut sound_targets: Vec<SoundTarget> = Vec::new();
     let mut gate_target: Option<(i32, i32, String)> = None;
     let mut all_member_count = 0usize;
     let mut bitmap_member_count = 0usize;
     let mut bitmap_avatar_count = 0usize;
     let mut sound_member_count = 0usize;
+    let mut sound_unnamed_count = 0usize;
 
     reserve_player_ref(|player| {
         for cast in player.movie.cast_manager.casts.iter() {
@@ -197,7 +218,7 @@ async fn dump_inner() {
                 } else {
                     member.name.clone()
                 };
-                match member.member_type {
+                match &member.member_type {
                     CastMemberType::Bitmap(_) => {
                         bitmap_member_count += 1;
                         if is_avatar_part(&name) {
@@ -209,8 +230,27 @@ async fn dump_inner() {
                         }
                         targets.push((cl, cm, name));
                     }
-                    CastMemberType::Sound(_) => {
+                    CastMemberType::Sound(sm) => {
                         sound_member_count += 1;
+                        if member.name.is_empty() {
+                            // Unnamed sound members can't be wired into a
+                            // gameplay scene without a name to reference,
+                            // so we skip them rather than emit `member_N.wav`
+                            // files that no one knows what to do with.
+                            sound_unnamed_count += 1;
+                            continue;
+                        }
+                        sound_targets.push(SoundTarget {
+                            cast_lib: cl,
+                            cast_member: cm,
+                            name: name.clone(),
+                            wav_bytes: sm.sound.to_wav(),
+                            channels: sm.sound.channels(),
+                            sample_rate: sm.sound.sample_rate(),
+                            bits_per_sample: sm.sound.bits_per_sample(),
+                            sample_count: sm.sound.sample_count(),
+                            codec: sm.sound.codec(),
+                        });
                     }
                     _ => {}
                 }
@@ -219,12 +259,14 @@ async fn dump_inner() {
     });
 
     summary.push(format!(
-        "Loaded {} cast members ({} bitmaps total: {} avatar parts skipped, {} game bitmaps; {} sounds; {} other).",
+        "Loaded {} cast members ({} bitmaps total: {} avatar parts skipped, {} game bitmaps; {} sounds total: {} unnamed skipped, {} extracting; {} other).",
         all_member_count,
         bitmap_member_count,
         bitmap_avatar_count,
         targets.len(),
         sound_member_count,
+        sound_unnamed_count,
+        sound_targets.len(),
         all_member_count - bitmap_member_count - sound_member_count
     ));
 
@@ -361,6 +403,62 @@ async fn dump_inner() {
             "  _members.json: {} entries → {}",
             members_meta.len(),
             meta_path
+        ));
+    }
+
+    // === Sound dump: emit .wav per named sound member + _sounds.json ===
+    // Sounds land under a `sounds/` subdir so they're grouped together
+    // and so a downstream consumer can mount the directory at e.g.
+    // <client>/games/recycler/sounds/ without re-organizing.
+    let sounds_dir = format!("{}/sounds", primary_dir);
+    let scratch_sounds_dir = format!("{}/sounds", SCRATCH_DUMP_ROOT);
+    if !sound_targets.is_empty() {
+        fs::create_dir_all(&sounds_dir).expect("create sounds dir");
+        fs::create_dir_all(&scratch_sounds_dir).ok();
+    }
+    let mut sounds_meta: Vec<serde_json::Value> = Vec::new();
+    let mut sound_ok = 0usize;
+    let mut sound_fail = 0usize;
+    for st in &sound_targets {
+        let safe = sanitize(&st.name);
+        let primary_wav = format!("{}/{}.wav", sounds_dir, safe);
+        let scratch_wav = format!("{}/{}_{}_{}.wav",
+            scratch_sounds_dir, st.cast_lib, st.cast_member, safe);
+        match fs::write(&primary_wav, &st.wav_bytes) {
+            Ok(_) => sound_ok += 1,
+            Err(_) => sound_fail += 1,
+        }
+        // Scratch sibling write — disambiguated by cast pair so re-runs
+        // don't collide on bare names.
+        fs::write(&scratch_wav, &st.wav_bytes).ok();
+        sounds_meta.push(serde_json::json!({
+            "name": st.name,
+            "filename": format!("{}.wav", safe),
+            "castLib": st.cast_lib,
+            "castMember": st.cast_member,
+            "channels": st.channels,
+            "sampleRate": st.sample_rate,
+            "bitsPerSample": st.bits_per_sample,
+            "sampleCount": st.sample_count,
+            "codec": st.codec,
+            "wavByteLength": st.wav_bytes.len(),
+        }));
+    }
+    if !sound_targets.is_empty() {
+        summary.push(format!(
+            "  Sound dump: {} ok, {} failed (of {} named sound members; {} unnamed skipped) → {}",
+            sound_ok, sound_fail, sound_targets.len(), sound_unnamed_count, sounds_dir
+        ));
+        let sounds_meta_path = format!("{}/_sounds.json", sounds_dir);
+        let sounds_meta_json = serde_json::to_string_pretty(&sounds_meta)
+            .expect("serialize sounds meta");
+        fs::write(&sounds_meta_path, &sounds_meta_json)
+            .expect("write _sounds.json");
+        // Scratch sibling write.
+        fs::write(format!("{}/_sounds.json", scratch_sounds_dir), &sounds_meta_json).ok();
+        summary.push(format!(
+            "  _sounds.json: {} entries → {}",
+            sounds_meta.len(), sounds_meta_path
         ));
     }
 
