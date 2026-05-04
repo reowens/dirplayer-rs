@@ -38,3 +38,7 @@ public/dcr*
 /dist-polyfill
 
 /test-results
+
+# Cargo workspace build output (introduced when the fork added a
+# top-level Cargo.toml; see vm-rust/.gitignore for the per-crate /target).
+/target

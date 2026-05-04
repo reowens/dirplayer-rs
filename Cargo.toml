@@ -1,0 +1,18 @@
+[workspace]
+members = ["vm-rust"]
+resolver = "2"
+
+# Mirror of vm-rust/Cargo.toml's [profile.*] sections. In a Cargo
+# workspace, profiles are honored only when defined at the workspace
+# root — member-level profile sections are ignored with a warning.
+# Keeping these in sync preserves the size-optimized wasm release
+# build (`opt-level = "s"`) when builds run via `cargo build -p vm-rust`
+# from the fork root.
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

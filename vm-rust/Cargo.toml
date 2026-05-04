@@ -129,20 +129,15 @@ version = "1.0.27"
 features = ["rust_backend"]
 default-features = false
 
-[profile.release]
-# Tell `rustc` to optimize for small code size.
-opt-level = "s"
+# Profiles ([profile.release], [profile.dev], [profile.dev.package."*"])
+# moved to the workspace root Cargo.toml — Cargo only honors profile
+# sections at the workspace root in a workspace context. Both
+# `cd vm-rust && cargo build` and `cd .. && cargo build -p vm-rust`
+# now read profiles from the same source of truth.
 
 [package.metadata.wasm-pack.profile.release]
 # default is ["-O"]; -g means to preserve debug symbols.
 wasm-opt = ["-O", "-g"]
-
-[profile.dev]
-# Turn on a small amount of optimisation in Development mode.
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 2
 
 [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
 dwarf-debug-info = true
