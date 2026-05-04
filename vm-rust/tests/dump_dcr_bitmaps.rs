@@ -9,11 +9,15 @@
 //!
 //! **Phase 2a goal** (extraction): once Phase 0 passes, the same test
 //! becomes the production-ready dumper for all Recycler bitmaps. It
-//! emits per-member PNGs to `/tmp/dirplayer_dumps/recycler/` plus a
-//! `_members.json` sidecar containing `{name, regX, regY, bitDepth,
-//! useAlpha, width, height}` per member — same schema as the publicroom
-//! dump, consumed downstream by hand-curation into the gating
-//! `docs/casts/recycler_cast_inventory.md`.
+//! emits per-member PNGs to `<OUTPUT_ROOT>/games/recycler/` (default
+//! `./out/games/recycler/` if unset) plus a `_members.json` sidecar
+//! containing `{name, regX, regY, bitDepth, useAlpha, width, height}`
+//! per member — same schema as the publicroom dump, consumed downstream
+//! by hand-curation into the gating `docs/casts/recycler_cast_inventory.md`.
+//! A scratch dual-write to `/tmp/dirplayer_dumps/recycler/` is also
+//! performed (mirrors `dump_cct_bitmaps.rs`'s `PER_ROOM_DUMP_ROOT`
+//! pattern) so debugging from a fixed path stays easy regardless of
+//! where the primary output is wired.
 //!
 //! Notes vs the .cct dumper:
 //!   - `.dcr` is a Director MOVIE (not a standalone .cct cast), so
@@ -32,11 +36,12 @@
 //!      ~/Development/packages/dirplayer-rs/vm-rust/tests/dump_dcr_bitmaps.rs
 //!
 //! Run:
-//!   cargo test -p vm-rust --test dump_dcr_bitmaps -- --nocapture
+//!   OUTPUT_ROOT=/tmp/dirplayer_test \
+//!     cargo test -p vm-rust --test dump_dcr_bitmaps -- --nocapture
 //!
 //! Acceptance for Phase 0: the test prints
 //!   ✓ Background <W>x<H> (<N> bytes)
-//! and at least one PNG appears under /tmp/dirplayer_dumps/recycler/.
+//! and at least one PNG appears under <OUTPUT_ROOT>/games/recycler/.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -60,7 +65,18 @@ fn dcr_path() -> String {
     let root = std::env::var("CASTS_ROOT").unwrap_or_else(|_| "./casts".to_string());
     format!("{}/games/FurniFactory/FurniFactory2.dcr", root)
 }
-const DUMP_ROOT: &str = "/tmp/dirplayer_dumps/recycler";
+/// Output root for the rendered PNGs + `_members.json` sidecar. Mirrors
+/// the env-var pattern in `dump_cct_bitmaps.rs`.
+fn output_root() -> String {
+    std::env::var("OUTPUT_ROOT").unwrap_or_else(|_| "./out".to_string())
+}
+fn recycler_output_dir() -> String {
+    format!("{}/games/recycler", output_root())
+}
+/// Scratch sibling write — preserved at a fixed path so debugging from
+/// a known location stays easy regardless of how `OUTPUT_ROOT` is wired.
+/// Matches `dump_cct_bitmaps.rs`'s `PER_ROOM_DUMP_ROOT` convention.
+const SCRATCH_DUMP_ROOT: &str = "/tmp/dirplayer_dumps/recycler";
 
 /// The single member name we use to gate Phase 0. The DCR's actual
 /// background bitmap is named `bg` (Lingo `Background` is a Director
@@ -109,7 +125,9 @@ fn dump_recycler_dcr_bitmaps() {
 }
 
 async fn dump_inner() {
-    fs::create_dir_all(DUMP_ROOT).expect("create dump root");
+    let primary_dir = recycler_output_dir();
+    fs::create_dir_all(&primary_dir).expect("create primary recycler dir");
+    fs::create_dir_all(SCRATCH_DUMP_ROOT).expect("create scratch dump root");
 
     let dcr = dcr_path();
     if !PathBuf::from(&dcr).exists() {
@@ -226,8 +244,11 @@ async fn dump_inner() {
     if let Some((cl, cm, name)) = &gate_target {
         let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
         if let Some((bytes, w, h)) = decode_png(&json) {
-            let out = format!("{}/{}.png", DUMP_ROOT, sanitize(name));
+            let out = format!("{}/{}.png", primary_dir, sanitize(name));
             fs::write(&out, &bytes).expect("write background png");
+            // Scratch sibling write for fixed-path debugging.
+            let scratch_out = format!("{}/{}.png", SCRATCH_DUMP_ROOT, sanitize(name));
+            fs::write(&scratch_out, &bytes).ok();
             summary.push(format!(
                 "  ✓ Phase 0 gate: {} {}x{} ({} bytes) → {}",
                 name,
@@ -263,7 +284,10 @@ async fn dump_inner() {
         let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
         let png = decode_png(&json);
         if let Some((bytes, _, _)) = &png {
-            let out = format!("{}/{}_{}_{}.png", DUMP_ROOT, cl, cm, sanitize(name));
+            let out = format!("{}/{}_{}_{}.png", primary_dir, cl, cm, sanitize(name));
+            // Scratch sibling write — same filename layout, fixed root.
+            let scratch_out = format!("{}/{}_{}_{}.png", SCRATCH_DUMP_ROOT, cl, cm, sanitize(name));
+            fs::write(&scratch_out, bytes).ok();
             if fs::write(&out, bytes).is_ok() {
                 dumped_count += 1;
             } else {
@@ -326,10 +350,13 @@ async fn dump_inner() {
 
     // === Write _members.json sidecar ===
     if !members_meta.is_empty() {
-        let meta_path = format!("{}/_members.json", DUMP_ROOT);
+        let meta_path = format!("{}/_members.json", primary_dir);
         let meta_json =
             serde_json::to_string_pretty(&members_meta).expect("serialize members meta");
-        fs::write(&meta_path, meta_json).expect("write _members.json");
+        fs::write(&meta_path, &meta_json).expect("write _members.json");
+        // Scratch sibling write.
+        let scratch_meta = format!("{}/_members.json", SCRATCH_DUMP_ROOT);
+        fs::write(&scratch_meta, &meta_json).ok();
         summary.push(format!(
             "  _members.json: {} entries → {}",
             members_meta.len(),
