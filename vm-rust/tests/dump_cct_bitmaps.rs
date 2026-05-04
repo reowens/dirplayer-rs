@@ -75,6 +75,7 @@ fn room_mapping() -> Vec<(&'static str, &'static str, &'static str)> {
         ("rio",               "rio",               "rio.background"),
         ("sanfrancisco",      "san_francisco",     "sanfrancisco_background"),
         ("seattle",           "seattle",           "roof_garden"),
+        ("secretroom",        "whale_wash",        "secretroom_whaleWash"),
         ("sydney",            "sydney",            "sydney_background"),
         ("tokyo",             "tokyo",             "tokyo_bg"),
     ]
