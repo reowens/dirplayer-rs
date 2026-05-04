@@ -100,7 +100,19 @@ async fn dump_inner() {
     let fg_members_by_room = read_canonical_fg_members();
 
     let rooms = room_mapping();
+    // Optional ROOM_FILTER: comma-separated list of cct_base or room_id values.
+    // When set, only matching rooms are dumped — useful for targeted regens that
+    // avoid re-extracting all 24 publicrooms (which produces binary-PNG diff
+    // noise across the committed assets).
+    let room_filter: Option<Vec<String>> = std::env::var("ROOM_FILTER").ok().map(|s| {
+        s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+    });
     for (cct_base, room_id, bg_name_override) in &rooms {
+        if let Some(filter) = &room_filter {
+            if !filter.iter().any(|f| f == cct_base || f == room_id) {
+                continue;
+            }
+        }
         let cct_path = format!("{}/{}.cct", publicrooms_dir(), cct_base);
         if !PathBuf::from(&cct_path).exists() {
             summary.push(format!("  ✗ {} → {}: cct not found at {}", cct_base, room_id, cct_path));
