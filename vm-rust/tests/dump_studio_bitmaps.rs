@@ -53,7 +53,7 @@ use std::path::PathBuf;
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::mcp_get_cast_member_picture;
+use vm_rust::player::mcp::{mcp_get_cast_member_picture, mcp_get_cast_member_picture_with_palette};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -63,13 +63,77 @@ fn cc_studio_path() -> String {
     let root = std::env::var("CASTS_ROOT").unwrap_or_else(|_| "./casts".to_string());
     format!("{}/cc_studio.cct", root)
 }
-/// Output dir for studio bg PNGs and the _studios.json / _studio_members.json
-/// sidecars. Defaults to `./out/rooms` under OUTPUT_ROOT.
+/// Output dir for studio bg PNGs and the _studios.json /
+/// _studio_members.json sidecars. Defaults to `./out/assets/rooms` under
+/// OUTPUT_ROOT. Matches the convention used by `dump_cct_bitmaps` and
+/// `dump_studio_palette_variants` so a single `OUTPUT_ROOT=<repo>/packages/client/public`
+/// works across all three dumpers (per EXTRACTOR.md "Run the dumpers"
+/// block). Prior versions of this dumper wrote to `<OUTPUT_ROOT>/rooms`
+/// without the `assets/` prefix, which forced the bitmap dumper to use a
+/// different OUTPUT_ROOT than the others.
 fn rooms_output_dir() -> String {
     let root = std::env::var("OUTPUT_ROOT").unwrap_or_else(|_| "./out".to_string());
-    format!("{}/rooms", root)
+    format!("{}/assets/rooms", root)
 }
 const SCRATCH_DUMP_ROOT: &str = "/tmp/dirplayer_dumps/cc_studio";
+
+/// Cast members whose bitmap header has no usable `palette_ref`;
+/// dirplayer-rs renders rainbow-stripe garbage without an explicit
+/// palette override. Discovered empirically 2026-05-04 by visual
+/// inspection of `studio_personal_suite/wall_corner_1_a_0_3_0.png`
+/// (a/c texture variants are broken; the matching b/d color back-fills
+/// extract correctly without override).
+///
+/// The override palette here is the room's first-listed wall texture
+/// palette — per upstream `Wall.ls displayPattern:175` and confirmed
+/// via md5 match between the existing `studio_model_a` working wall
+/// extractions and the `dump_studio_palette_variants.rs` output, the
+/// canonical default is `right_wall_plates` / `left_wall_plates`.
+///
+/// Returns the palette member name to use as the override, or None if
+/// the default extraction path should be used.
+fn default_palette_override_for(member_name: &str) -> Option<&'static str> {
+    match member_name {
+        "wall_corner_1_a_0_3_0" => Some("right_wall_plates"),
+        "wall_corner_1_c_0_3_0" => Some("left_wall_plates"),
+        _ => None,
+    }
+}
+
+/// Cast members in cc_studio.cct that are referenced unconditionally
+/// from upstream Lingo (NOT from per-room SceneXml), so their per-room
+/// `canonical.members` never lists them. Without explicit emission
+/// here, the per-room dump loop skips them and runtime asset lookups
+/// 404 silently.
+///
+/// Sources:
+///   - `wall_doormask_1_a/b_0_2_0` — drawn unconditionally by every
+///     studio's door per `Door.ls:82-83` (`oWall.drawWallTile` calls
+///     OUTSIDE the layout `case` block). Required by all 9 studios.
+///   - `studio.window.<city>.{1,2,3}` — drawn by `Window.ls drawWindow`
+///     when SceneXml has a `<Window>` node. Studios A/B/C/D have
+///     `<Window imageBase="london"/>` (verified 2026-05-04). E/F/G +
+///     suites have no `<Window>` upstream — exclude.
+const SHARED_DOORMASK_MEMBERS: &[&str] = &[
+    "wall_doormask_1_a_0_2_0",
+    "wall_doormask_1_b_0_2_0",
+];
+const SHARED_WINDOW_MEMBERS: &[&str] = &[
+    "studio.window.london.1",
+    "studio.window.london.2",
+    "studio.window.london.3",
+];
+
+fn extra_shared_members_for(registry_id: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = SHARED_DOORMASK_MEMBERS.to_vec();
+    if matches!(
+        registry_id,
+        "studio_model_a" | "studio_model_b" | "studio_model_c" | "studio_model_d"
+    ) {
+        out.extend(SHARED_WINDOW_MEMBERS);
+    }
+    out
+}
 
 /// (cast member name in cc_studio.cct, furni room id).
 /// Order matches the cc_studio.json declaration order so summary output
@@ -201,22 +265,35 @@ async fn dump_inner() {
     // bitmap (avatar parts, doormasks, lamps, etc.) for inspection.
     let mut name_to_id: std::collections::HashMap<String, (i32, i32)> =
         std::collections::HashMap::new();
+    // Palette members are indexed separately (not bitmap members) so the
+    // 0.1a default-palette override path can resolve member names like
+    // `right_wall_plates`. Same shape as dump_studio_palette_variants.rs.
+    let mut palette_to_id: std::collections::HashMap<String, (i32, i32)> =
+        std::collections::HashMap::new();
     let mut all_bitmaps: Vec<(i32, i32, String)> = Vec::new();
     reserve_player_ref(|player| {
         for cast in player.movie.cast_manager.casts.iter() {
             for (member_num, member) in cast.members.iter() {
-                if matches!(member.member_type, CastMemberType::Bitmap(_)) {
-                    let cl = cast.number as i32;
-                    let cm = *member_num as i32;
-                    let name = if member.name.is_empty() {
-                        format!("member_{}", member_num)
-                    } else {
-                        member.name.clone()
-                    };
-                    if !member.name.is_empty() {
-                        name_to_id.insert(member.name.clone(), (cl, cm));
+                let cl = cast.number as i32;
+                let cm = *member_num as i32;
+                match &member.member_type {
+                    CastMemberType::Bitmap(_) => {
+                        let name = if member.name.is_empty() {
+                            format!("member_{}", member_num)
+                        } else {
+                            member.name.clone()
+                        };
+                        if !member.name.is_empty() {
+                            name_to_id.insert(member.name.clone(), (cl, cm));
+                        }
+                        all_bitmaps.push((cl, cm, name));
                     }
-                    all_bitmaps.push((cl, cm, name));
+                    CastMemberType::Palette(_) => {
+                        if !member.name.is_empty() {
+                            palette_to_id.insert(member.name.clone(), (cl, cm));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -329,12 +406,45 @@ async fn dump_inner() {
 
         let mut dir_writes: usize = 0;
         let mut dir_misses: Vec<String> = Vec::new();
-        for member_name in member_names {
+
+        // Build a single iteration covering canonical members PLUS the
+        // unconditional-Lingo shared members. Dedup so a future overlap
+        // (a shared member that ALSO appears in canonical.members) doesn't
+        // double-write.
+        let extras = extra_shared_members_for(registry_id);
+        let mut to_emit: Vec<String> = member_names.clone();
+        for name in &extras {
+            if !to_emit.iter().any(|m| m == *name) {
+                to_emit.push(name.to_string());
+            }
+        }
+
+        for member_name in &to_emit {
             let Some(&(cl, cm)) = name_to_id.get(member_name) else {
                 dir_misses.push(member_name.clone());
                 continue;
             };
-            let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, cl, cm));
+            // Phase 0.1a: for cast members with no usable palette_ref,
+            // force an explicit palette override at extract time.
+            // Otherwise dirplayer-rs renders rainbow garbage (e.g.
+            // wall_corner_1_a/c_0_3_0 ship without a baked default palette).
+            let json = if let Some(pal_name) = default_palette_override_for(member_name) {
+                if let Some(&(pal_cl, pal_cm)) = palette_to_id.get(pal_name) {
+                    reserve_player_ref(|player| {
+                        mcp_get_cast_member_picture_with_palette(
+                            player, cl, cm, pal_cl, pal_cm,
+                        )
+                    })
+                } else {
+                    // Override palette member missing from cct — fall
+                    // back to default extraction (will produce rainbow,
+                    // but at least preserves prior behavior).
+                    dir_misses.push(format!("{} (override palette '{}' missing)", member_name, pal_name));
+                    continue;
+                }
+            } else {
+                reserve_player_ref(|player| mcp_get_cast_member_picture(player, cl, cm))
+            };
             let Some((bytes, _w, _h)) = decode_png(&json) else {
                 dir_misses.push(format!("{} (png decode failed)", member_name));
                 continue;
