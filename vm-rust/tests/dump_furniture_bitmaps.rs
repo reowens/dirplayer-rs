@@ -1,13 +1,11 @@
-//! Native integration test: dump per-cast-member regPoint metadata from
-//! `cc_furniture[1].cct` to `<OUTPUT_ROOT>/furniture/_cc_furniture_members.json`.
+//! Native integration test: dump every named bitmap member of
+//! `cc_furniture[1].cct` as PNG plus a regPoint metadata sidecar.
 //!
 //! Sibling of `dump_engine_bitmaps.rs`. Same TestPlayer +
-//! `mcp_get_cast_member_picture` toolchain, but emits JSON only — no
-//! PNGs. The cokephase PNGs in
-//! `upstream/cokemusic-cokephase/assets/furniture/data/` remain the
-//! authoritative atlas source; this dumper exists purely to recover
-//! per-(layer, rotation) regPoints that the cokephase pipeline lost
-//! when it composited everything into single-cell PNGs.
+//! `mcp_get_cast_member_picture` toolchain. PNGs are raw cast pixels —
+//! no ink keying (per the mcp.rs rule, ink is a per-sprite property;
+//! buildFurnitureAtlases.ts bakes the white chroma-key using the
+//! `.ink` text members from extracted/engine/cc_furniture.json).
 //!
 //! Run:
 //!   CASTS_ROOT=/abs/path/upstream/cokemusic-casts/client2 \
@@ -15,11 +13,18 @@
 //!   cargo test -p vm-rust --test dump_furniture_bitmaps -- --nocapture
 //!
 //! Output:
+//!   - <OUTPUT_ROOT>/furniture/data/<member_name>.png
+//!     One PNG per named bitmap member, first-occurrence (lowest cast
+//!     member number) wins on name collisions — matches Director's
+//!     first-match name lookup. Stems follow the same
+//!     `{base}_{layer}_{cell}_{w}_{h}_{dir}_{frame}` convention as the
+//!     cokephase PNGs, because cokephase named its files after these
+//!     same cast members.
 //!   - <OUTPUT_ROOT>/furniture/_cc_furniture_members.json
-//!     One entry per named bitmap member: name, sourceCct, castLib,
-//!     castMember, regX, regY, bitDepth, originalBitDepth, useAlpha,
-//!     width, height. Consumers (buildFurnitureAtlases.ts) look up
-//!     anchors by `name` matching the cokephase PNG stem.
+//!     One entry per named bitmap member: name, filename, sourceCct,
+//!     castLib, castMember, regX, regY, bitDepth, originalBitDepth,
+//!     useAlpha, width, height. Consumers (buildFurnitureAtlases.ts)
+//!     look up anchors by `name` matching the PNG stem.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -43,6 +48,9 @@ fn furniture_output_dir() -> String {
     let root = std::env::var("OUTPUT_ROOT").unwrap_or_else(|_| "./out".to_string());
     format!("{}/furniture", root)
 }
+fn furniture_png_dir() -> String {
+    format!("{}/data", furniture_output_dir())
+}
 
 #[test]
 fn dump_furniture_cct_bitmaps() {
@@ -51,6 +59,7 @@ fn dump_furniture_cct_bitmaps() {
 
 async fn dump_inner() {
     fs::create_dir_all(furniture_output_dir()).expect("create furniture assets dir");
+    fs::create_dir_all(furniture_png_dir()).expect("create furniture data dir");
 
     let cct_path = format!("{}/{}", casts_root(), CCT_NAME);
     if !PathBuf::from(&cct_path).exists() {
@@ -91,8 +100,10 @@ async fn dump_inner() {
 
     // Collect every named bitmap. Members keep first-occurrence registration
     // (matches Director's lowest-cm name resolution); duplicates are skipped.
-    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut targets: Vec<(i32, i32, String)> = Vec::new();
+    // `cast.members` is a HashMap, so collect everything first and sort by
+    // (castLib, castMember) before deduping — otherwise the collision winner
+    // is non-deterministic (cf. the same fix in dump_cct_bitmaps.rs).
+    let mut all_named: Vec<(i32, i32, String)> = Vec::new();
     let mut total_bitmaps = 0usize;
     let mut unnamed_bitmaps = 0usize;
 
@@ -105,26 +116,38 @@ async fn dump_inner() {
                         unnamed_bitmaps += 1;
                         continue;
                     }
-                    if seen_names.insert(member.name.clone()) {
-                        targets.push((cast.number as i32, *member_num as i32, member.name.clone()));
-                    }
+                    all_named.push((cast.number as i32, *member_num as i32, member.name.clone()));
                 }
             }
         }
     });
+    all_named.sort_by_key(|(cl, cm, _)| (*cl, *cm));
+
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut targets: Vec<(i32, i32, String)> = Vec::new();
+    let mut duplicate_bitmaps = 0usize;
+    for (cl, cm, name) in all_named {
+        if seen_names.insert(name.clone()) {
+            targets.push((cl, cm, name));
+        } else {
+            duplicate_bitmaps += 1;
+        }
+    }
 
     // Sort by name for deterministic JSON output (diff-friendly).
     targets.sort_by(|a, b| a.2.cmp(&b.2));
 
     summary.push(format!(
-        "  loaded {} → {} bitmap members ({} named, {} unnamed)",
+        "  loaded {} → {} bitmap members ({} named, {} unnamed, {} duplicate names skipped)",
         CCT_NAME,
         total_bitmaps,
         targets.len(),
         unnamed_bitmaps,
+        duplicate_bitmaps,
     ));
 
     let mut decode_failures = 0usize;
+    let mut pngs_written = 0usize;
     for (cl, cm, name) in &targets {
         let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
         let parsed: serde_json::Value = match serde_json::from_str(&json) {
@@ -135,8 +158,16 @@ async fn dump_inner() {
             }
         };
 
+        let filename = format!("{}.png", name);
+        if let Some(bytes) = decode_png_bytes(&parsed) {
+            let png_path = format!("{}/{}", furniture_png_dir(), filename);
+            fs::write(&png_path, &bytes).expect("write furniture png");
+            pngs_written += 1;
+        }
+
         members_meta.push(serde_json::json!({
             "name": name,
+            "filename": filename,
             "sourceCct": CCT_NAME,
             "castLib": cl,
             "castMember": cm,
@@ -151,8 +182,10 @@ async fn dump_inner() {
     }
 
     summary.push(format!(
-        "  emitted {} member entries ({} decode failures)",
+        "  emitted {} member entries, {} PNGs → {} ({} decode failures)",
         members_meta.len(),
+        pngs_written,
+        furniture_png_dir(),
         decode_failures,
     ));
 
@@ -167,4 +200,10 @@ async fn dump_inner() {
     for line in &summary {
         println!("{}", line);
     }
+}
+
+fn decode_png_bytes(parsed: &serde_json::Value) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let b64 = parsed.get("png_base64")?.as_str()?;
+    base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok()
 }
