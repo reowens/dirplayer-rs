@@ -24,12 +24,20 @@
 //! combo per Floor.ls / Wall.ls dispatch.
 //!
 //! Dispatch table (source: Floor.ls:184 + Wall.ls:47-54, 175):
-//!   studiofloor_1         × floor_*       palettes  (15 floor patterns)
-//!   studiofloor_door_1    × floor_*       palettes  (15)
-//!   right_wall_1_a_0_2_0  × right_wall_*  palettes  (~20)
-//!   left_wall_1_a_0_0_0   × left_wall_*   palettes  (~20)
-//!   wall_corner_1_a_0_3_0 × right_wall_*  palettes  (right-corner texture overlay)
-//!   wall_corner_1_c_0_3_0 × left_wall_*   palettes  (left-corner texture overlay)
+//!   studiofloor_1          × floor_*       palettes  (15 floor patterns)
+//!   studiofloor_door_1     × floor_*       palettes  (15)
+//!   right_wall_1_a_0_2_0   × right_wall_*  palettes  (~20)
+//!   left_wall_1_a_0_0_0    × left_wall_*   palettes  (~20)
+//!   wall_corner_1_a_0_3_0  × right_wall_*  palettes  (right-corner texture overlay)
+//!   wall_corner_1_c_0_3_0  × left_wall_*   palettes  (left-corner texture overlay)
+//!   wall_doormask_1_a_0_2_0 × right_wall_* palettes  (over-door wallpaper texture)
+//!
+//! The over-door wallpaper (`wall_doormask_1_a`) is a `"right"`-dir wall
+//! tile — `Door.ls:82-83` draws it via `oWall.drawWallTile(..., "right",
+//! "wall_doormask", "texture", ...)`, so `Wall.ls:175 displayPattern`
+//! swaps its palette to `right_wall_<palette>` exactly like every other
+//! right-wall texture. Only the `_a` texture layer takes the CLUT swap;
+//! the `_b` color layer is tinted via `sprite.color`/`blend`, no variant.
 //!
 //! Corners participate in the per-dir palette set per Wall.ls:47-54
 //! (case-switch has only `right` / `left` branches; `bCorner` only
@@ -77,6 +85,10 @@ const DISPATCH: &[(&str, &str)] = &[
     ("left_wall_1_a_0_0_0",    "left_wall_"),
     ("wall_corner_1_a_0_3_0",  "right_wall_"),
     ("wall_corner_1_c_0_3_0",  "left_wall_"),
+    // Over-door wallpaper texture. A `"right"`-dir wall tile per
+    // Door.ls:82-83 → shares the `right_wall_*` palette set. Only the
+    // `_a` texture layer swaps palette; `_b` is the tinted color layer.
+    ("wall_doormask_1_a_0_2_0", "right_wall_"),
 ];
 
 /// Names whose `<prefix><suffix>` shape would false-match the dispatch
