@@ -81,6 +81,22 @@ fn room_mapping() -> Vec<(&'static str, &'static str, &'static str)> {
     ]
 }
 
+/// Extra palette families for a multi-palette bitmap. Some fixtures (Tokyo's
+/// disco floor) carry SEVERAL independent palette families under one shared
+/// parent prefix — `peaceful`/`action`/`switch`, each ≥3 frames. The primary
+/// `palette_cycle_info` pass only emits the bitmap's own default family
+/// (whose group already has ≥3 frames, so the cousin-group fallback never
+/// fires). This struct carries the additional sibling families so a separate,
+/// additive pass can render them without disturbing the primary output.
+///
+/// `primary_short` is the default family's short label (e.g. "peaceful");
+/// `extras` are the sibling families as `(short_label, default_frame,
+/// siblings)` where `siblings` are `(frame_n, pal_cast_lib, pal_cast_member)`.
+struct ExtraPalettes {
+    primary_short: String,
+    extras: Vec<(String, i32, Vec<(i32, i32, i32)>)>,
+}
+
 #[test]
 fn dump_publicroom_cct_bitmaps() {
     async_std::task::block_on(dump_inner());
@@ -405,6 +421,106 @@ async fn dump_inner() {
                     Some((group_label, chosen_default_frame, siblings))
                 });
 
+            // Additive multi-palette pass (SEPARATE from the primary discovery
+            // above, which stays byte-identical). Some bitmaps carry MULTIPLE
+            // independent palette families sharing one parent prefix — Tokyo's
+            // disco floor has `tokyo_discofloor_peaceful_1..16`,
+            // `..._action_1..16` and `..._switch_1..16`. The primary pass only
+            // emits the bitmap's own default family (peaceful) because it
+            // already has ≥3 frames, so the cousin-group fallback never fires.
+            // Here we re-derive the sibling families and hand them off for
+            // rendering. Only the DIRECT case (default family ≥3 frames) can
+            // carry extras; the fallback case (default family <3, e.g. Neptune
+            // whose `peaceful` has a single frame) must stay a single group, so
+            // we bail out to keep those rooms unchanged.
+            let extra_palettes: Option<ExtraPalettes> =
+                reserve_player_ref(|player| {
+                    let cast = player.movie.cast_manager.get_cast(*cl as u32).ok()?;
+                    let bitmap_member = cast.members.get(&(*cm as u32))?
+                        .member_type.as_bitmap()?;
+                    let bitmap = player.bitmap_manager.get_bitmap(bitmap_member.image_ref)?;
+                    if bitmap.original_bit_depth > 8 { return None; }
+                    let pal_ref = match &bitmap.palette_ref {
+                        PaletteRef::Member(r) => r.clone(),
+                        _ => return None,
+                    };
+                    let pal_cast = player.movie.cast_manager
+                        .get_cast(pal_ref.cast_lib as u32).ok()?;
+                    let pal_member = pal_cast.members.get(&(pal_ref.cast_member as u32))?;
+                    let pal_name = pal_member.name.clone();
+                    if pal_name.is_empty() { return None; }
+                    // Same default-group derivation as the primary pass.
+                    let digit_start = pal_name
+                        .char_indices()
+                        .rev()
+                        .take_while(|(_, c)| c.is_ascii_digit())
+                        .last()
+                        .map(|(i, _)| i)?;
+                    if digit_start == 0 { return None; }
+                    let default_group = pal_name[..digit_start].to_string();
+                    // Reuse the primary pass's sibling-collection pattern.
+                    let collect = |g: &str| -> Vec<(i32, i32, i32)> {
+                        let mut out: Vec<(i32, i32, i32)> = Vec::new();
+                        for (sib_num, sib) in pal_cast.members.iter() {
+                            if sib.member_type.as_palette().is_none() { continue; }
+                            let n = &sib.name;
+                            if !n.starts_with(g) { continue; }
+                            let suffix = &n[g.len()..];
+                            if let Ok(frame_n) = suffix.parse::<i32>() {
+                                out.push((frame_n, pal_ref.cast_lib, *sib_num as i32));
+                            }
+                        }
+                        out
+                    };
+                    // Fallback case → don't add extras (keep single-group rooms).
+                    if collect(&default_group).len() < 3 { return None; }
+                    // Walk back one `_` segment to the shared parent prefix, then
+                    // group every palette member under it by cousin family —
+                    // exactly like the primary pass's cousin-group fallback.
+                    let trimmed = default_group.trim_end_matches('_');
+                    let last_us = trimmed.rfind('_')?;
+                    let parent_prefix = &trimmed[..=last_us]; // includes trailing `_`
+                    let mut cousin_groups: HashMap<String, Vec<(i32, i32, i32)>> = HashMap::new();
+                    for (sib_num, sib) in pal_cast.members.iter() {
+                        if sib.member_type.as_palette().is_none() { continue; }
+                        let n = &sib.name;
+                        if !n.starts_with(parent_prefix) { continue; }
+                        let rest = &n[parent_prefix.len()..];
+                        if let Some(us) = rest.rfind('_') {
+                            if let Ok(frame_n) = rest[us+1..].parse::<i32>() {
+                                let cg = format!("{}{}_", parent_prefix, &rest[..us]);
+                                cousin_groups
+                                    .entry(cg)
+                                    .or_default()
+                                    .push((frame_n, pal_ref.cast_lib, *sib_num as i32));
+                            }
+                        }
+                    }
+                    // Keep cousin families with ≥3 frames, EXCLUDING the default
+                    // family (it's already emitted by the primary pass).
+                    let mut extras: Vec<(String, i32, Vec<(i32, i32, i32)>)> = Vec::new();
+                    for (cg, mut sibs) in cousin_groups {
+                        if cg == default_group { continue; }
+                        if sibs.len() < 3 { continue; }
+                        sibs.sort_by_key(|t| t.0);
+                        let short_label = cg
+                            .strip_prefix(parent_prefix)
+                            .unwrap_or(&cg)
+                            .trim_end_matches('_')
+                            .to_string();
+                        let default_frame = sibs[0].0;
+                        extras.push((short_label, default_frame, sibs));
+                    }
+                    if extras.is_empty() { return None; }
+                    extras.sort_by(|a, b| a.0.cmp(&b.0));
+                    let primary_short = default_group
+                        .strip_prefix(parent_prefix)
+                        .unwrap_or(&default_group)
+                        .trim_end_matches('_')
+                        .to_string();
+                    Some(ExtraPalettes { primary_short, extras })
+                });
+
             let palette_frames_meta: Option<serde_json::Value> = palette_cycle_info
                 .as_ref()
                 .map(|(group, _default_frame, siblings)| {
@@ -434,6 +550,79 @@ async fn dump_inner() {
                     serde_json::Value::Object(frames_map)
                 });
 
+            // Additive multi-palette emission: when the extras pass found
+            // sibling families (Tokyo peaceful/action/switch), render each
+            // extra family's PNGs (`<file_stem>__<short_label>__pal_<n>.png`)
+            // and build a `paletteGroups` object that ALSO re-uses the primary
+            // family's already-rendered (unprefixed) filenames — we never
+            // re-render the primary. Rooms without extras produce None here and
+            // emit nothing new, so their `_members.json` stays byte-identical.
+            let palette_groups_meta: Option<serde_json::Value> = match (
+                extra_palettes.as_ref(),
+                palette_frames_meta.as_ref(),
+                palette_cycle_info.as_ref(),
+            ) {
+                (
+                    Some(extra),
+                    Some(primary_frames),
+                    Some((_group, primary_default, _sibs)),
+                ) if !extra.extras.is_empty() => {
+                    let mut groups = serde_json::Map::new();
+                    // Primary family: re-use the already-written unprefixed PNGs.
+                    groups.insert(
+                        extra.primary_short.clone(),
+                        serde_json::json!({
+                            "default": *primary_default,
+                            "frames": primary_frames.clone(),
+                        }),
+                    );
+                    let mut family_summary: Vec<String> = vec![format!(
+                        "{}({})",
+                        extra.primary_short,
+                        primary_frames.as_object().map(|m| m.len()).unwrap_or(0)
+                    )];
+                    // Each extra family: render its own PNGs now (mirrors the
+                    // primary `palette_frames_meta` loop above).
+                    for (short_label, default_frame, sibs) in &extra.extras {
+                        let mut frames_map = serde_json::Map::new();
+                        for (frame_n, pal_cl, pal_cm) in sibs {
+                            let frame_json = reserve_player_ref(|player| {
+                                mcp_get_cast_member_picture_with_palette(
+                                    player, *cl, *cm, *pal_cl, *pal_cm,
+                                )
+                            });
+                            if let Some((bytes, _, _)) = decode_png(&frame_json) {
+                                let fname = format!(
+                                    "{}__{}__pal_{}.png",
+                                    file_stem, short_label, frame_n
+                                );
+                                let path = format!("{}/{}", fg_dest_dir, fname);
+                                fs::write(path, &bytes).ok();
+                                frames_map.insert(
+                                    frame_n.to_string(),
+                                    serde_json::Value::String(fname),
+                                );
+                            }
+                        }
+                        family_summary.push(format!("{}({})", short_label, frames_map.len()));
+                        groups.insert(
+                            short_label.clone(),
+                            serde_json::json!({
+                                "default": *default_frame,
+                                "frames": serde_json::Value::Object(frames_map),
+                            }),
+                        );
+                    }
+                    summary.push(format!(
+                        "    multi-palette: {} → {}",
+                        emit_name,
+                        family_summary.join(" + ")
+                    ));
+                    Some(serde_json::Value::Object(groups))
+                }
+                _ => None,
+            };
+
             // Capture metadata regardless of PNG decode success — name lookup
             // and bitmap shape are useful even for empty/zero-byte members.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
@@ -461,6 +650,13 @@ async fn dump_inner() {
                                    serde_json::Value::from(*default_frame));
                         obj.insert("paletteGroup".into(),
                                    serde_json::Value::String(group.clone()));
+                    }
+                    // Additive: attach the multi-palette `paletteGroups` object
+                    // (primary + extra families) when the extras pass produced
+                    // one. Left untouched (absent) for every other member.
+                    if let Some(groups) = palette_groups_meta {
+                        let obj = entry.as_object_mut().unwrap();
+                        obj.insert("paletteGroups".into(), groups);
                     }
                     members_meta.push(entry);
                 }
