@@ -187,6 +187,7 @@ async fn dump_inner() {
     let mut manifest: Vec<(String, String, String)> = Vec::new();
     let mut total_writes: usize = 0;
     let mut total_misses: Vec<String> = Vec::new();
+    let mut direct_color_skips: Vec<serde_json::Value> = Vec::new();
 
     summary.push(format!(
         "  loaded cc_studio.cct → {} bitmap members, {} palette members indexed",
@@ -204,21 +205,34 @@ async fn dump_inner() {
             continue;
         };
 
-        // Indexed-bitmap eligibility — same check as the cct cycle dumper
-        // at dump_cct_bitmaps.rs:306. Skip 16/32-bit bitmaps; CLUT swaps
-        // are no-ops on non-indexed.
+        // Director CLUT swaps only affect indexed storage. 16/32-bit members
+        // expose direct RGB pixels, so rendering them under another palette
+        // would only duplicate identical PNGs.
         let is_indexed = reserve_player_ref(|player| -> Option<bool> {
             let cast = player.movie.cast_manager.get_cast(bitmap_cl as u32).ok()?;
             let member = cast.members.get(&(bitmap_cm as u32))?;
             let bm = member.member_type.as_bitmap()?;
             let bitmap = player.bitmap_manager.get_bitmap(bm.image_ref)?;
-            Some(bitmap.original_bit_depth <= 8)
-        }).unwrap_or(false);
-        if !is_indexed {
+            Some(bitmap.has_palette())
+        });
+        let Some(is_indexed) = is_indexed else {
+            total_misses.push(format!("bitmap {} metadata unavailable", bitmap_name));
             summary.push(format!(
-                "  ✗ {:<24} ← {:<13} bitmap is not 8bpp indexed (skip)",
+                "  ✗ {:<24} ← {:<13} bitmap metadata unavailable",
                 bitmap_name, palette_prefix
             ));
+            continue;
+        };
+        if !is_indexed {
+            summary.push(format!(
+                "  · {:<24} ← {:<13} direct-color bitmap; CLUT swap is a no-op",
+                bitmap_name, palette_prefix
+            ));
+            direct_color_skips.push(serde_json::json!({
+                "bitmap": bitmap_name,
+                "palettePrefix": palette_prefix,
+                "reason": "directColorPaletteSwapIsNoOp",
+            }));
             continue;
         }
 
@@ -274,6 +288,7 @@ async fn dump_inner() {
             "palette": p,
             "file": f,
         })).collect::<Vec<_>>(),
+        "skipped": direct_color_skips,
     });
     let manifest_path = format!(
         "{}/_studio_palette_variants.json",

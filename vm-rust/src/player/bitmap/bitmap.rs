@@ -1295,4 +1295,46 @@ mod tests {
         );
         assert_ne!(color, (255, 0, 255));
     }
+
+    #[test]
+    fn direct_color_bitmaps_ignore_palette_changes() {
+        let palettes = PaletteMap::new();
+        let mut bitmap_16 = Bitmap::new(
+            1,
+            1,
+            16,
+            16,
+            0,
+            PaletteRef::BuiltIn(BuiltInPalette::Rainbow),
+        );
+        bitmap_16.data = vec![0x00, 0xF8];
+        let color_16 = bitmap_16.get_pixel_color_with_alpha(&palettes, 0, 0);
+        bitmap_16.palette_ref = PaletteRef::BuiltIn(BuiltInPalette::GrayScale);
+        assert_eq!(bitmap_16.get_pixel_color_with_alpha(&palettes, 0, 0), color_16);
+        assert!(!bitmap_16.has_palette());
+
+        let mut bitmap_32 = Bitmap::new(
+            1,
+            1,
+            32,
+            32,
+            8,
+            PaletteRef::BuiltIn(BuiltInPalette::Rainbow),
+        );
+        bitmap_32.data = vec![12, 34, 56, 78];
+        let color_32 = bitmap_32.get_pixel_color_with_alpha(&palettes, 0, 0);
+        bitmap_32.palette_ref = PaletteRef::BuiltIn(BuiltInPalette::GrayScale);
+        assert_eq!(bitmap_32.get_pixel_color_with_alpha(&palettes, 0, 0), color_32);
+        assert!(!bitmap_32.has_palette());
+
+        assert!(Bitmap::new(
+            1,
+            1,
+            8,
+            8,
+            0,
+            PaletteRef::BuiltIn(BuiltInPalette::Rainbow),
+        )
+        .has_palette());
+    }
 }

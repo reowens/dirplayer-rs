@@ -206,6 +206,8 @@ async fn dump_inner() {
     let mut bitmap_avatar_count = 0usize;
     let mut sound_member_count = 0usize;
     let mut sound_unnamed_count = 0usize;
+    let mut avatar_skip_examples: Vec<serde_json::Value> = Vec::new();
+    let mut unnamed_sound_examples: Vec<serde_json::Value> = Vec::new();
 
     reserve_player_ref(|player| {
         for cast in player.movie.cast_manager.casts.iter() {
@@ -223,6 +225,13 @@ async fn dump_inner() {
                         bitmap_member_count += 1;
                         if is_avatar_part(&name) {
                             bitmap_avatar_count += 1;
+                            if avatar_skip_examples.len() < 20 {
+                                avatar_skip_examples.push(serde_json::json!({
+                                    "castLib": cl,
+                                    "castMember": cm,
+                                    "name": name,
+                                }));
+                            }
                             continue; // skip avatar-engine duplicates
                         }
                         if name == PHASE_0_GATE_MEMBER {
@@ -238,6 +247,12 @@ async fn dump_inner() {
                             // so we skip them rather than emit `member_N.wav`
                             // files that no one knows what to do with.
                             sound_unnamed_count += 1;
+                            if unnamed_sound_examples.len() < 20 {
+                                unnamed_sound_examples.push(serde_json::json!({
+                                    "castLib": cl,
+                                    "castMember": cm,
+                                }));
+                            }
                             continue;
                         }
                         sound_targets.push(SoundTarget {
@@ -462,6 +477,37 @@ async fn dump_inner() {
             sounds_meta.len(), sounds_meta_path
         ));
     }
+
+    let skipped_count = bitmap_avatar_count + sound_unnamed_count;
+    let skip_summary_path = format!("{}/_skip_summary.json", primary_dir);
+    let skip_summary = serde_json::json!({
+        "dumper": "dump_dcr_bitmaps",
+        "totalSkipped": skipped_count,
+        "categories": [
+            {
+                "reason": "avatarPartHandledByPeopleCast",
+                "count": bitmap_avatar_count,
+                "examples": avatar_skip_examples,
+            },
+            {
+                "reason": "unnamedSound",
+                "count": sound_unnamed_count,
+                "examples": unnamed_sound_examples,
+            },
+        ],
+    });
+    let skip_summary_json =
+        serde_json::to_string_pretty(&skip_summary).expect("serialize dcr skip summary");
+    fs::write(&skip_summary_path, &skip_summary_json).expect("write dcr skip summary");
+    fs::write(
+        format!("{}/_skip_summary.json", SCRATCH_DUMP_ROOT),
+        &skip_summary_json,
+    )
+    .ok();
+    summary.push(format!(
+        "  Skip summary: {} entries → {}",
+        skipped_count, skip_summary_path
+    ));
 
     print_summary(&summary);
 

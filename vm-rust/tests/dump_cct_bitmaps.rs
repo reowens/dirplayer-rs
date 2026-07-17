@@ -110,6 +110,9 @@ async fn dump_inner() {
     // the loaded movie/cast.
     let mut player = TestPlayer::new();
     let mut summary: Vec<String> = Vec::new();
+    let mut missing_source_ccts: Vec<serde_json::Value> = Vec::new();
+    let mut unnamed_film_loops: Vec<serde_json::Value> = Vec::new();
+    let mut film_loop_export_errors: Vec<serde_json::Value> = Vec::new();
 
     // Read each room's canonical.roomBitmaps so we know which FG members
     // (door masks, bears, bardesks, etc.) to dump per room.
@@ -132,6 +135,11 @@ async fn dump_inner() {
         let cct_path = format!("{}/{}.cct", publicrooms_dir(), cct_base);
         if !PathBuf::from(&cct_path).exists() {
             summary.push(format!("  ✗ {} → {}: cct not found at {}", cct_base, room_id, cct_path));
+            missing_source_ccts.push(serde_json::json!({
+                "sourceCct": format!("{}.cct", cct_base),
+                "roomId": room_id,
+                "reason": "sourceCctMissing",
+            }));
             continue;
         }
 
@@ -203,6 +211,14 @@ async fn dump_inner() {
                             // translator + runtime can read.
                             if !member.name.is_empty() {
                                 film_loop_targets.push((cl, cm, member.name.clone()));
+                            } else {
+                                unnamed_film_loops.push(serde_json::json!({
+                                    "sourceCct": format!("{}.cct", cct_base),
+                                    "roomId": room_id,
+                                    "castLib": cl,
+                                    "castMember": cm,
+                                    "reason": "unnamedFilmLoop",
+                                }));
                             }
                         }
                         _ => {}
@@ -319,7 +335,7 @@ async fn dump_inner() {
                     let bitmap_member = cast.members.get(&(*cm as u32))?
                         .member_type.as_bitmap()?;
                     let bitmap = player.bitmap_manager.get_bitmap(bitmap_member.image_ref)?;
-                    if bitmap.original_bit_depth > 8 { return None; }
+                    if !bitmap.has_palette() { return None; }
                     let pal_ref = match &bitmap.palette_ref {
                         PaletteRef::Member(r) => r.clone(),
                         _ => return None,
@@ -439,7 +455,7 @@ async fn dump_inner() {
                     let bitmap_member = cast.members.get(&(*cm as u32))?
                         .member_type.as_bitmap()?;
                     let bitmap = player.bitmap_manager.get_bitmap(bitmap_member.image_ref)?;
-                    if bitmap.original_bit_depth > 8 { return None; }
+                    if !bitmap.has_palette() { return None; }
                     let pal_ref = match &bitmap.palette_ref {
                         PaletteRef::Member(r) => r.clone(),
                         _ => return None,
@@ -683,11 +699,24 @@ async fn dump_inner() {
             // Skip writing on handler errors (mcp_error returns
             // `{"error": "..."}`); real manifests always include "frame_count".
             if !json.contains("\"frame_count\"") {
+                let reason = serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|value| value.get("error").and_then(|error| error.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| json.lines().next().unwrap_or("(empty)").to_string());
                 summary.push(format!(
                     "    filmLoop {} skipped: {}",
                     name,
-                    json.lines().next().unwrap_or("(empty)")
+                    reason
                 ));
+                film_loop_export_errors.push(serde_json::json!({
+                    "sourceCct": format!("{}.cct", cct_base),
+                    "roomId": room_id,
+                    "castLib": cl,
+                    "castMember": cm,
+                    "name": name,
+                    "reason": "filmLoopExportError",
+                    "error": reason,
+                }));
                 continue;
             }
             let out_path = format!("{}/{}_frames.json", fg_dest_dir, name);
@@ -725,6 +754,27 @@ async fn dump_inner() {
             summary.push(format!("    scene-furn-bitmaps available: {}", scene_furn_dumped));
         }
     }
+
+    let skipped_count = missing_source_ccts.len()
+        + unnamed_film_loops.len()
+        + film_loop_export_errors.len();
+    let skip_summary_path = format!("{}/_skip_summary.json", rooms_output_dir());
+    let skip_summary = serde_json::json!({
+        "dumper": "dump_cct_bitmaps",
+        "totalSkipped": skipped_count,
+        "missingSourceCcts": missing_source_ccts,
+        "unnamedFilmLoops": unnamed_film_loops,
+        "filmLoopExportErrors": film_loop_export_errors,
+    });
+    fs::write(
+        &skip_summary_path,
+        serde_json::to_string_pretty(&skip_summary).expect("serialize cct skip summary"),
+    )
+    .expect("write cct skip summary");
+    summary.push(format!(
+        "  skip summary: {} entries → {}",
+        skipped_count, skip_summary_path
+    ));
 
     println!();
     println!("=== Bg extraction summary ({} rooms) ===", rooms.len());
