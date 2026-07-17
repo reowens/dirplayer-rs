@@ -176,6 +176,7 @@ async fn dump_inner() {
             "bitDepth": parsed.get("bit_depth"),
             "originalBitDepth": parsed.get("original_bit_depth"),
             "useAlpha": parsed.get("use_alpha"),
+            "paletteRef": parsed.get("palette_ref"),
             "width": parsed.get("width"),
             "height": parsed.get("height"),
         }));
@@ -204,6 +205,9 @@ async fn dump_inner() {
 
 fn decode_png_bytes(parsed: &serde_json::Value) -> Option<Vec<u8>> {
     use base64::Engine;
+    if let Some(error) = parsed.get("error").and_then(|value| value.as_str()) {
+        panic!("cast bitmap export failed: {}", error);
+    }
     let b64 = parsed.get("png_base64")?.as_str()?;
     base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok()
 }

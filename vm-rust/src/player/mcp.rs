@@ -1112,6 +1112,18 @@ fn render_picture_inner(
         )),
     };
 
+    if bitmap_ref.width != bitmap_member.info.width || bitmap_ref.height != bitmap_member.info.height {
+        return mcp_error(format!(
+            "Bitmap data for cast member {}/{} failed to decode: declared {}x{}, loaded fallback {}x{}",
+            cast_lib,
+            cast_member,
+            bitmap_member.info.width,
+            bitmap_member.info.height,
+            bitmap_ref.width,
+            bitmap_ref.height,
+        ));
+    }
+
     // Clone-and-mutate when overriding palette. The clone is per-call (one
     // per palette frame at dump time), which is acceptable for an offline
     // tool. `Bitmap` derives Clone (bitmap.rs:130). For the no-override
@@ -1132,26 +1144,14 @@ fn render_picture_inner(
     // Director's 32bpp bitmaps store ARGB but the alpha channel is only
     // semantically valid when `use_alpha` is true. For opaque 32bpp images
     // (eg. room backgrounds with `useAlpha=false` in Lingo), the stored
-    // alpha bytes are zero and have to be forced to 0xFF or the dumped PNG
-    // is fully transparent. 8bpp indexed bitmaps already return a=0xFF
+    // alpha bytes are zero and have to be reconstructed or the dumped PNG is
+    // fully transparent. 8bpp indexed bitmaps already return a=0xFF
     // unconditionally upstream, so this only affects the 32bpp path.
     let force_opaque_32bpp = bitmap.bit_depth == 32 && !bitmap.use_alpha;
     let mut img = RgbaImage::new(width as u32, height as u32);
     for y in 0..height {
         for x in 0..width {
             let (r, g, b, a) = bitmap.get_pixel_color_with_alpha(&palettes, x, y);
-            let mut a = a;
-            // 32bpp force-opaque: only flip alpha=>255 when the pixel has
-            // non-zero RGB. Room backgrounds (tokyo_bg etc.) have visible
-            // RGB content + a true-black (0,0,0,0) diamond margin that should
-            // stay transparent for the room cutout. Effect overlays
-            // (tokyo_bear_headlight, tokyo_pitlight) are 32bpp non-use-alpha
-            // bitmaps that are mostly all-zero and intended to render
-            // transparent at composite time; the pixel-aware check keeps
-            // those zeros transparent while making real content opaque.
-            if force_opaque_32bpp && (r != 0 || g != 0 || b != 0) {
-                a = 0xFF;
-            }
             // NB: 8bpp ink=8 (Background Transparent) chroma-keying is
             // deliberately NOT applied here. Ink mode is a per-sprite
             // property in Director (lives on the SceneXml element, not
@@ -1161,6 +1161,9 @@ fn render_picture_inner(
             // palette[0] background color.
             img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, a]));
         }
+    }
+    if force_opaque_32bpp {
+        restore_non_alpha_32bpp_opacity(&mut img);
     }
 
     let mut png_bytes: Vec<u8> = Vec::new();
@@ -1203,6 +1206,118 @@ fn render_picture_inner(
         data_head_hex,
         png_base64,
     })
+}
+
+/// Reconstruct opacity for 32bpp members whose stored alpha channel is disabled.
+/// Director matte semantics treat edge-connected all-zero pixels as the outside;
+/// enclosed pixels remain content even when their RGB value is pure black.
+fn restore_non_alpha_32bpp_opacity(img: &mut image::RgbaImage) {
+    use std::collections::VecDeque;
+
+    fn enqueue_zero(
+        img: &image::RgbaImage,
+        width: u32,
+        outside: &mut [bool],
+        pending: &mut VecDeque<(u32, u32)>,
+        x: u32,
+        y: u32,
+    ) {
+        let index = (y * width + x) as usize;
+        if !outside[index] && img.get_pixel(x, y).0 == [0, 0, 0, 0] {
+            outside[index] = true;
+            pending.push_back((x, y));
+        }
+    }
+
+    let width = img.width();
+    let height = img.height();
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let mut outside = vec![false; (width * height) as usize];
+    let mut pending = VecDeque::new();
+
+    for x in 0..width {
+        enqueue_zero(img, width, &mut outside, &mut pending, x, 0);
+        enqueue_zero(img, width, &mut outside, &mut pending, x, height - 1);
+    }
+    for y in 0..height {
+        enqueue_zero(img, width, &mut outside, &mut pending, 0, y);
+        enqueue_zero(img, width, &mut outside, &mut pending, width - 1, y);
+    }
+
+    while let Some((x, y)) = pending.pop_front() {
+        if x > 0 {
+            enqueue_zero(img, width, &mut outside, &mut pending, x - 1, y);
+        }
+        if x + 1 < width {
+            enqueue_zero(img, width, &mut outside, &mut pending, x + 1, y);
+        }
+        if y > 0 {
+            enqueue_zero(img, width, &mut outside, &mut pending, x, y - 1);
+        }
+        if y + 1 < height {
+            enqueue_zero(img, width, &mut outside, &mut pending, x, y + 1);
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            if !outside[(y * width + x) as usize] {
+                img.get_pixel_mut(x, y).0[3] = 0xFF;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::restore_non_alpha_32bpp_opacity;
+    use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn non_alpha_opacity_keeps_all_zero_overlay_transparent() {
+        let mut img = RgbaImage::new(3, 3);
+
+        restore_non_alpha_32bpp_opacity(&mut img);
+
+        assert!(img.pixels().all(|pixel| pixel.0[3] == 0));
+    }
+
+    #[test]
+    fn non_alpha_opacity_preserves_enclosed_pure_black_content() {
+        let mut img = RgbaImage::new(5, 5);
+        for y in 1..=3 {
+            for x in 1..=3 {
+                if x == 2 && y == 2 {
+                    continue;
+                }
+                img.put_pixel(x, y, Rgba([10, 20, 30, 0]));
+            }
+        }
+
+        restore_non_alpha_32bpp_opacity(&mut img);
+
+        assert_eq!(img.get_pixel(0, 0).0[3], 0);
+        assert_eq!(img.get_pixel(1, 1).0[3], 255);
+        assert_eq!(img.get_pixel(2, 2).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn non_alpha_opacity_leaves_edge_connected_black_transparent() {
+        let mut img = RgbaImage::new(5, 5);
+        for x in 1..=3 {
+            img.put_pixel(x, 1, Rgba([10, 20, 30, 0]));
+            img.put_pixel(x, 3, Rgba([10, 20, 30, 0]));
+        }
+        img.put_pixel(3, 2, Rgba([10, 20, 30, 0]));
+
+        restore_non_alpha_32bpp_opacity(&mut img);
+
+        assert_eq!(img.get_pixel(2, 2).0[3], 0);
+        assert_eq!(img.get_pixel(3, 2).0[3], 255);
+    }
 }
 
 /// Convert Director's raw blend byte to a 0..=100 opacity percentage.

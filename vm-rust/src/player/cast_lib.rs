@@ -17,7 +17,7 @@ use crate::{
 use super::{
     allocator::DatumAllocator,
     bitmap::{
-        bitmap::{Bitmap, BuiltInPalette, PaletteRef},
+        bitmap::{Bitmap, BuiltInPalette, PaletteRef, get_file_default_palette},
         manager::BitmapManager,
     },
     cast_member::{
@@ -263,7 +263,7 @@ impl CastLib {
 
     pub fn apply_cast_def(
         &mut self,
-        _: &DirectorFile,
+        file: &DirectorFile,
         cast_def: &CastDef,
         bitmap_manager: &mut BitmapManager,
         font_table: &HashMap<u16, String>,
@@ -274,9 +274,17 @@ impl CastLib {
         self.palette_id_offset = cast_def.palette_id_offset;
         self.state = CastLibState::Loaded;
         for (id, member_def) in &cast_def.members {
+            let member = CastMember::from(self.number, *id, member_def, &self.lctx, bitmap_manager, self.dir_version, self.palette_id_offset, font_table);
+            if let CastMemberType::Bitmap(bitmap_member) = &member.member_type {
+                if let Some(bitmap) = bitmap_manager.get_bitmap_mut(bitmap_member.image_ref) {
+                    if matches!(bitmap.palette_ref, PaletteRef::Default) {
+                        bitmap.palette_ref = PaletteRef::BuiltIn(get_file_default_palette(file.endian));
+                    }
+                }
+            }
             self.insert_member(
                 *id,
-                CastMember::from(self.number, *id, member_def, &self.lctx, bitmap_manager, self.dir_version, self.palette_id_offset, font_table),
+                member,
             );
             JsApi::on_cast_member_name_changed(CastMemberRefHandlers::get_cast_slot_number(
                 self.number,

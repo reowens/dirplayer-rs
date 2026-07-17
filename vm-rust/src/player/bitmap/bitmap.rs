@@ -30,8 +30,8 @@ use super::{
 pub enum PaletteRef {
     BuiltIn(BuiltInPalette),
     Member(CastMemberRef),
-    /// Use the movie's default palette (first available custom palette, or system palette if none)
-    /// This is used when palette_id=0 (meaning "use default" rather than a specific member)
+    /// Use the movie platform's default system palette.
+    /// This is used when palette_id=0 (meaning "use default" rather than a specific member).
     Default,
 }
 
@@ -54,7 +54,7 @@ impl PaletteRef {
                 }
             }
         } else if i == 0 {
-            PaletteRef::BuiltIn(get_system_default_palette())
+            PaletteRef::Default
         } else {
             // clut_cast_lib >= 0: use as-is (0 = search all, >0 = explicit cast lib)
             // clut_cast_lib < 0: not set, use bitmap's own cast lib (ScummVM: _cast->_castLibID)
@@ -123,8 +123,16 @@ impl BuiltInPalette {
 }
 
 pub fn get_system_default_palette() -> BuiltInPalette {
-    // TODO: Properly detect platform from movie file format
     BuiltInPalette::SystemWin
+}
+
+pub fn get_file_default_palette(endian: binary_reader::Endian) -> BuiltInPalette {
+    match endian {
+        binary_reader::Endian::Big | binary_reader::Endian::Network => BuiltInPalette::SystemMac,
+        binary_reader::Endian::Little => BuiltInPalette::SystemWin,
+        binary_reader::Endian::Native if cfg!(target_endian = "big") => BuiltInPalette::SystemMac,
+        binary_reader::Endian::Native => BuiltInPalette::SystemWin,
+    }
 }
 
 #[derive(Clone)]
@@ -477,19 +485,14 @@ fn decode_generic_bitmap(
     let expected_size = scan_width as usize * scan_height as usize * num_channels as usize * bytes_per_pixel as usize;
 
     if expected_size != data.len() {
-        warn!(
-            "decode_generic_bitmap: Expected {} bytes, got {}",
+        return Err(format!(
+            "decode_generic_bitmap: expected {} bytes for {}x{} {}-bit bitmap with {} channel(s), got {}",
             expected_size,
-            data.len()
-        );
-        let actual_bit_depth = bit_depth * num_channels;
-        return Ok(Bitmap::new(
             width,
             height,
-            actual_bit_depth,
             bit_depth,
-            0,
-            palette_ref,
+            num_channels,
+            data.len()
         ));
     } else {
         let mut result =
@@ -938,14 +941,9 @@ fn lookup_builtin_palette(palette: &BuiltInPalette, color_index: u8, original_bi
 }
 
 #[inline]
-fn color_fallback(color_index: u8) -> (u8, u8, u8) {
-    if color_index == 0 {
-        (255, 255, 255)
-    } else if color_index == 255 {
-        (0, 0, 0)
-    } else {
-        (255, 0, 255) // magenta for missing colors
-    }
+fn color_fallback(color_index: u8, original_bit_depth: u8) -> (u8, u8, u8) {
+    lookup_builtin_palette(&get_system_default_palette(), color_index, original_bit_depth)
+        .unwrap_or((0, 0, 0))
 }
 
 #[inline]
@@ -962,7 +960,7 @@ pub fn resolve_color_ref(
             match palette_ref {
                 PaletteRef::BuiltIn(palette) => {
                     lookup_builtin_palette(palette, idx, original_bit_depth)
-                        .unwrap_or_else(|| color_fallback(idx))
+                        .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
                 }
                 PaletteRef::Member(member_ref) => {
                     // cast_lib 0 = search all cast libs by member number
@@ -978,21 +976,21 @@ pub fn resolve_color_ref(
                     };
                     if let Some(member) = palette_member {
                         member.colors.get(idx as usize).copied()
-                            .unwrap_or_else(|| color_fallback(idx))
+                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
                     } else if let Some(member) = palettes.find_by_cast_lib(member_ref.cast_lib as u32) {
                         // Fallback: exact palette member not found (stale clutId from old numbering),
                         // use any palette in the same cast library
                         member.colors.get(idx as usize).copied()
-                            .unwrap_or_else(|| color_fallback(idx))
+                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
                     } else {
                         lookup_builtin_palette(&get_system_default_palette(), idx, original_bit_depth)
-                            .unwrap_or_else(|| color_fallback(idx))
+                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
                     }
                 }
                 PaletteRef::Default => {
                     // palette_id=0 means "no specific palette set" - use system default palette
                     lookup_builtin_palette(&get_system_default_palette(), idx, original_bit_depth)
-                        .unwrap_or_else(|| color_fallback(idx))
+                        .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
                 }
             }
         }
@@ -1250,4 +1248,51 @@ pub fn decode_jpeg_bitmap(data: &[u8], info: &BitmapInfo, alfa_data: Option<&Vec
         was_trimmed: false,
         version: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_bitmap_rejects_short_data_instead_of_returning_blank_pixels() {
+        let result = decode_generic_bitmap(2, 2, 8, 1, 2, 2, PaletteRef::Default, &[1, 2, 3]);
+
+        let error = result.err().expect("short bitmap data must fail decoding");
+        assert!(error.contains("expected 4 bytes"), "{error}");
+        assert!(error.contains("got 3"), "{error}");
+    }
+
+    #[test]
+    fn generic_bitmap_rejects_trailing_data_instead_of_ignoring_it() {
+        let result = decode_generic_bitmap(2, 2, 8, 1, 2, 2, PaletteRef::Default, &[1, 2, 3, 4, 5]);
+
+        let error = result.err().expect("oversized bitmap data must fail decoding");
+        assert!(error.contains("expected 4 bytes"), "{error}");
+        assert!(error.contains("got 5"), "{error}");
+    }
+
+    #[test]
+    fn file_default_palette_follows_director_container_byte_order() {
+        assert_eq!(get_file_default_palette(binary_reader::Endian::Big), BuiltInPalette::SystemMac);
+        assert_eq!(get_file_default_palette(binary_reader::Endian::Little), BuiltInPalette::SystemWin);
+        assert_eq!(PaletteRef::from(0, -1, 1), PaletteRef::Default);
+    }
+
+    #[test]
+    fn missing_member_palette_uses_system_colors_instead_of_magenta() {
+        let palettes = PaletteMap::new();
+        let missing = PaletteRef::Member(CastMemberRef {
+            cast_lib: 99,
+            cast_member: 99,
+        });
+
+        let color = resolve_color_ref(&palettes, &ColorRef::PaletteIndex(42), &missing, 8);
+
+        assert_eq!(
+            color,
+            lookup_builtin_palette(&get_system_default_palette(), 42, 8).unwrap()
+        );
+        assert_ne!(color, (255, 0, 255));
+    }
 }

@@ -317,6 +317,9 @@ async fn dump_inner() {
 
 fn decode_png(json: &str) -> Option<(Vec<u8>, u64, u64)> {
     use base64::Engine;
+    if let Some(error) = extract_str(json, "error") {
+        panic!("cast bitmap export failed: {}", error);
+    }
     let b64 = extract_str(json, "png_base64")?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
