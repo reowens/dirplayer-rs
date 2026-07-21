@@ -401,7 +401,7 @@ export function getMcpUrl(): string {
 export function isMcpEnabled(): boolean {
   // Override for asset-extraction harness: REACT_APP_MCP_FORCE_ENABLED=true
   // forces MCP on even when localStorage hasn't been seeded.
-  if (typeof process !== 'undefined' && process.env?.REACT_APP_MCP_FORCE_ENABLED === 'true') {
+  if (process.env.REACT_APP_MCP_FORCE_ENABLED === 'true') {
     return true;
   }
   return window.localStorage.getItem(MCP_ENABLED_KEY) === 'true';

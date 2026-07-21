@@ -172,7 +172,6 @@ async function startMcpServer(port) {
       });
     });
     console.log(`MCP server listening on http://127.0.0.1:${port}`);
-    console.log(`MCP bearer token: ${token}`);
     return publishMcpStatus({
       state: 'listening',
       host: '127.0.0.1',
