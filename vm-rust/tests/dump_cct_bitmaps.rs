@@ -113,6 +113,7 @@ async fn dump_inner() {
     let mut missing_source_ccts: Vec<serde_json::Value> = Vec::new();
     let mut unnamed_film_loops: Vec<serde_json::Value> = Vec::new();
     let mut film_loop_export_errors: Vec<serde_json::Value> = Vec::new();
+    let mut selected_rooms: Vec<serde_json::Value> = Vec::new();
 
     // Read each room's canonical.roomBitmaps so we know which FG members
     // (door masks, bears, bardesks, etc.) to dump per room.
@@ -132,6 +133,10 @@ async fn dump_inner() {
                 continue;
             }
         }
+        selected_rooms.push(serde_json::json!({
+            "sourceCct": format!("{}.cct", cct_base),
+            "roomId": room_id,
+        }));
         let cct_path = format!("{}/{}.cct", publicrooms_dir(), cct_base);
         if !PathBuf::from(&cct_path).exists() {
             summary.push(format!("  ✗ {} → {}: cct not found at {}", cct_base, room_id, cct_path));
@@ -755,12 +760,26 @@ async fn dump_inner() {
         }
     }
 
+    unnamed_film_loops.sort_by(compare_skip_entries);
+    film_loop_export_errors.sort_by(compare_skip_entries);
+
     let skipped_count = missing_source_ccts.len()
         + unnamed_film_loops.len()
         + film_loop_export_errors.len();
-    let skip_summary_path = format!("{}/_skip_summary.json", rooms_output_dir());
+    let (scope_kind, skip_summary_name) = if room_filter.is_some() {
+        ("filtered", "_skip_summary.filtered.json")
+    } else {
+        ("full", "_skip_summary.json")
+    };
+    let selected_room_count = selected_rooms.len();
+    let skip_summary_path = format!("{}/{}", rooms_output_dir(), skip_summary_name);
     let skip_summary = serde_json::json!({
         "dumper": "dump_cct_bitmaps",
+        "scope": {
+            "kind": scope_kind,
+            "roomFilter": room_filter,
+            "selectedRooms": selected_rooms,
+        },
         "totalSkipped": skipped_count,
         "missingSourceCcts": missing_source_ccts,
         "unnamedFilmLoops": unnamed_film_loops,
@@ -777,10 +796,28 @@ async fn dump_inner() {
     ));
 
     println!();
-    println!("=== Bg extraction summary ({} rooms) ===", rooms.len());
+    println!("=== Bg extraction summary ({} rooms) ===", selected_room_count);
     for line in &summary {
         println!("{}", line);
     }
+}
+
+fn compare_skip_entries(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> std::cmp::Ordering {
+    json_string(left, "sourceCct").cmp(json_string(right, "sourceCct"))
+        .then_with(|| json_string(left, "roomId").cmp(json_string(right, "roomId")))
+        .then_with(|| json_number(left, "castLib").cmp(&json_number(right, "castLib")))
+        .then_with(|| json_number(left, "castMember").cmp(&json_number(right, "castMember")))
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value.get(key).and_then(|field| field.as_str()).unwrap_or("")
+}
+
+fn json_number(value: &serde_json::Value, key: &str) -> i64 {
+    value.get(key).and_then(|field| field.as_i64()).unwrap_or_default()
 }
 
 fn decode_png(json: &str) -> Option<(Vec<u8>, u64, u64)> {

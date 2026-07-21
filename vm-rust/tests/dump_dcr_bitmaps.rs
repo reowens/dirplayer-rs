@@ -225,13 +225,11 @@ async fn dump_inner() {
                         bitmap_member_count += 1;
                         if is_avatar_part(&name) {
                             bitmap_avatar_count += 1;
-                            if avatar_skip_examples.len() < 20 {
-                                avatar_skip_examples.push(serde_json::json!({
-                                    "castLib": cl,
-                                    "castMember": cm,
-                                    "name": name,
-                                }));
-                            }
+                            avatar_skip_examples.push(serde_json::json!({
+                                "castLib": cl,
+                                "castMember": cm,
+                                "name": name,
+                            }));
                             continue; // skip avatar-engine duplicates
                         }
                         if name == PHASE_0_GATE_MEMBER {
@@ -247,12 +245,10 @@ async fn dump_inner() {
                             // so we skip them rather than emit `member_N.wav`
                             // files that no one knows what to do with.
                             sound_unnamed_count += 1;
-                            if unnamed_sound_examples.len() < 20 {
-                                unnamed_sound_examples.push(serde_json::json!({
-                                    "castLib": cl,
-                                    "castMember": cm,
-                                }));
-                            }
+                            unnamed_sound_examples.push(serde_json::json!({
+                                "castLib": cl,
+                                "castMember": cm,
+                            }));
                             continue;
                         }
                         sound_targets.push(SoundTarget {
@@ -478,6 +474,11 @@ async fn dump_inner() {
         ));
     }
 
+    avatar_skip_examples.sort_by(compare_skip_examples);
+    avatar_skip_examples.truncate(20);
+    unnamed_sound_examples.sort_by(compare_skip_examples);
+    unnamed_sound_examples.truncate(20);
+
     let skipped_count = bitmap_avatar_count + sound_unnamed_count;
     let skip_summary_path = format!("{}/_skip_summary.json", primary_dir);
     let skip_summary = serde_json::json!({
@@ -516,6 +517,23 @@ async fn dump_inner() {
         gate_target.is_some() && dumped_count > 0,
         "Phase 0 gate did not pass — see summary above"
     );
+}
+
+fn compare_skip_examples(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> std::cmp::Ordering {
+    json_number(left, "castLib").cmp(&json_number(right, "castLib"))
+        .then_with(|| json_number(left, "castMember").cmp(&json_number(right, "castMember")))
+        .then_with(|| json_string(left, "name").cmp(json_string(right, "name")))
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value.get(key).and_then(|field| field.as_str()).unwrap_or("")
+}
+
+fn json_number(value: &serde_json::Value, key: &str) -> i64 {
+    value.get(key).and_then(|field| field.as_i64()).unwrap_or_default()
 }
 
 fn print_summary(summary: &[String]) {
