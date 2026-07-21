@@ -6,8 +6,7 @@
  * Check if the app is running in Electron
  */
 export function isElectron(): boolean {
-  // Renderer process
-  if (typeof window !== 'undefined' && typeof window.process === 'object' && (window.process as any).type === 'renderer') {
+  if (typeof window !== 'undefined' && window.dirplayerElectron) {
     return true;
   }
 
@@ -29,12 +28,10 @@ export function isElectron(): boolean {
  * Returns the selected file path or null if cancelled
  */
 export async function openFileDialog(): Promise<string | null> {
-  if (!isElectron()) {
+  if (!window.dirplayerElectron) {
     throw new Error('openFileDialog can only be called in Electron environment');
   }
-
-  const { ipcRenderer } = window.require('electron');
-  return await ipcRenderer.invoke('dialog:openFile');
+  return window.dirplayerElectron.openFileDialog();
 }
 
 /**
@@ -42,16 +39,18 @@ export async function openFileDialog(): Promise<string | null> {
  * Returns the file data as a Uint8Array
  */
 export async function readLocalFile(filePath: string): Promise<Uint8Array> {
-  if (!isElectron()) {
+  if (!window.dirplayerElectron) {
     throw new Error('readLocalFile can only be called in Electron environment');
   }
+  const result = await window.dirplayerElectron.readLocalFile(filePath);
 
-  const { ipcRenderer } = window.require('electron');
-  const result = await ipcRenderer.invoke('fs:readFile', filePath);
-
-  if (result.success) {
+  if (result.success && result.data) {
     return new Uint8Array(result.data);
   } else {
-    throw new Error(`Failed to read file: ${result.error}`);
+    throw new Error(`Failed to read file: ${result.error || 'Unknown error'}`);
   }
+}
+
+export function getElectronPlatform(): string | null {
+  return window.dirplayerElectron?.platform || null;
 }

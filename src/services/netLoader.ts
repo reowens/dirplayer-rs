@@ -2,7 +2,7 @@
  * Network loader service that handles both browser fetch and Electron local file loading
  */
 
-import { isElectron, readLocalFile } from '../utils/electron';
+import { getElectronPlatform, isElectron, readLocalFile } from '../utils/electron';
 import { provide_net_task_data } from 'vm-rust';
 
 /**
@@ -26,7 +26,7 @@ export function initializeNetLoader() {
       if (url.startsWith('file://')) {
         // Extract the file path from the URL
         let filePath = decodeURIComponent(url.replace('file://', ''))
-        if (process.platform === 'win32' && filePath.startsWith('/')) {
+        if (getElectronPlatform() === 'win32' && filePath.startsWith('/')) {
           filePath = filePath.slice(1);
         } else {
           filePath = filePath.replace(/^\/+/, '/');

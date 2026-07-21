@@ -980,9 +980,14 @@ impl WebAudioBackend {
         // Resume context (required for autoplay policy)
         // The resume() call will handle suspended state internally
         console::log_1(&JsValue::from_str("▶️ Resuming AudioContext..."));
-        self.context
+        let promise = self.context
             .resume()
             .map_err(|e| format!("Failed to resume context: {:?}", e))?;
+        spawn_local(async move {
+            if let Err(error) = JsFuture::from(promise).await {
+                console::error_1(&format!("Failed to resume context: {:?}", error).into());
+            }
+        });
         Ok(())
     }
 
@@ -3152,10 +3157,11 @@ impl SoundChannel {
         audio.set_src(&url);
 
         // Play the audio
-        audio.play().map_err(|e| {
+        let play_promise = audio.play().map_err(|e| {
             console::error_1(&format!("Failed to play audio: {:?}", e).into());
             e
         })?;
+        JsFuture::from(play_promise).await?;
 
         debug!("▶️ MP3 playback started");
 
@@ -3983,7 +3989,7 @@ impl SoundChannel {
                 .map_err(|e| JsValue::from_str(&format!("Failed to create object URL: {:?}", e)))?;
 
             let audio = HtmlAudioElement::new_with_src(&url)?;
-            audio.play()?;
+            JsFuture::from(audio.play()?).await?;
             return Ok(());
         }
 
@@ -4019,15 +4025,14 @@ impl SoundChannel {
         }
     }
 
-    pub fn set_volume(&mut self, volume: f64) -> Result<(), JsValue> {
+    pub fn set_volume(&mut self, volume: f64) {
         self.volume = volume.clamp(0.0, 255.0);
         if let Some(ref gain) = self.gain_node {
             gain.gain().set_value((self.volume / 255.0) as f32);
         }
-        Ok(())
     }
 
-    pub fn set_pan(&mut self, pan: f64) -> Result<(), JsValue> {
+    pub fn set_pan(&mut self, pan: f64) {
         let clamped = pan.clamp(-1.0, 1.0);
 
         if let Some(ref pan_node) = self.pan_node {
@@ -4035,7 +4040,6 @@ impl SoundChannel {
             console::log_1(&JsValue::from_str(&format!("🎚️ Pan set to {:.2}", clamped)));
         }
 
-        Ok(())
     }
 
     // This is the static entry point called by the AudioBufferSourceNode's 'onended' event.

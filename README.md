@@ -152,12 +152,25 @@ Manual initialization:
 The polyfill automatically detects and replaces `<embed>` and `<object>` elements that reference Shockwave `.dcr` files.
 
 ## Requirements
-- NodeJS
-  - [(LTS or newer)](https://nodejs.org/)
-- RustLang
-  - [(1.70.0 or newer)](https://www.rust-lang.org/)
-- wasm-pack
-  - https://github.com/rustwasm/wasm-pack/releases
+- [Node.js](https://nodejs.org/) and npm. Repository automation exercises
+  Node.js 20, but this repository does not contain evidence for exact Node.js
+  or npm versions, so neither is pinned here.
+- [rustup](https://rustup.rs/) with Rust 1.95.0 and the
+  `wasm32-unknown-unknown` target. Both are declared in
+  [`rust-toolchain.toml`](rust-toolchain.toml).
+- [wasm-pack 0.14.0](https://github.com/drager/wasm-pack/releases/tag/v0.14.0).
+
+Install the pinned Rust and wasm tooling with:
+
+```bash
+rustup toolchain install 1.95.0 --profile minimal --target wasm32-unknown-unknown
+cargo install wasm-pack --version 0.14.0 --locked
+npm run check:toolchain
+```
+
+The VM build entry points fail before building when the exact Rust toolchain,
+wasm target, or wasm-pack version is unavailable. They also put the rustup
+toolchain ahead of system Rust installations when invoking wasm-pack.
 
 ## Building
 > [!NOTE]  
@@ -216,6 +229,77 @@ npm run start
 ```bash
 npm run electron-dev
 ```
+
+### Local control-service authentication
+
+The Electron MCP server is disabled by default and always binds to
+`127.0.0.1`. Enabling it generates a new 256-bit bearer token. The token is
+printed once in the Electron output and can also be copied from the `MCP ON`
+control. Every MCP POST must send it:
+
+```bash
+curl http://127.0.0.1:9847 \
+  -H "Authorization: Bearer $DIRPLAYER_MCP_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+For scripts that need the token before Electron starts, generate it once for
+that run and pass the same environment variable to Electron and the client:
+
+```bash
+export DIRPLAYER_MCP_TOKEN="$(node -p 'require("crypto").randomBytes(32).toString("base64url")')"
+REACT_APP_MCP_FORCE_ENABLED=true npm run electron-dev
+```
+
+Requests without an `Origin` header are accepted for local CLI clients.
+Browser origins are denied by default; explicitly allow only required origins
+with the comma-separated `DIRPLAYER_MCP_ALLOWED_ORIGINS` variable.
+If VM work exceeds the MCP deadline, the listener closes, queued requests fail,
+and MCP remains in `RESTART REQUIRED` state until DirPlayer is restarted. This
+avoids starting concurrent work while a synchronous WASM call may still be
+running.
+
+Opening a local Director movie now asks before granting read access to its
+parent folder. The folder path and session-only scope are shown explicitly,
+Cancel is the default, sibling resources are readable only after approval, and
+paths outside the approved real directory remain blocked.
+
+`npm run start:proxy` generates and shares a run-scoped proxy token with the
+browser automatically and permits only the local React development origins. It
+also honors a preconfigured `DIRPLAYER_PROXY_TOKEN` and passes that exact token
+to both processes. For a browser and proxy launched in separate terminals,
+generate `DIRPLAYER_PROXY_TOKEN` first, export the same value as
+`REACT_APP_DIRPLAYER_PROXY_TOKEN` before starting the browser, then run
+`npm run proxy` with `DIRPLAYER_PROXY_TOKEN` still exported. A token generated
+by standalone `npm run proxy` can only be handed to clients that can set an
+upgrade header or subprotocol after reading its output; an already-running
+browser bundle cannot discover it. Set
+`DIRPLAYER_PROXY_ALLOWED_ORIGINS` to an exact comma-separated allowlist when a
+browser client is used.
+
+For separate browser and proxy terminals, use the same generated value:
+
+```bash
+# Terminal 1
+export DIRPLAYER_PROXY_TOKEN="$(node -p 'require("crypto").randomBytes(32).toString("base64url")')"
+export REACT_APP_DIRPLAYER_PROXY_TOKEN="$DIRPLAYER_PROXY_TOKEN"
+npm start
+
+# Terminal 2: paste the value printed by `printf '%s\n' "$DIRPLAYER_PROXY_TOKEN"`
+export DIRPLAYER_PROXY_TOKEN='<same 43-character token>'
+npm run proxy
+```
+
+Run all local P8.4/P8.6 toolchain and security checks with:
+
+```bash
+npm run test:security
+```
+
+The command runs the transport, token-handoff, file-grant, Electron policy,
+toolchain policy, production build, and live isolated-preload tests. These are
+local release checks; they are not wired into a standing workflow.
 
 ## Join our Discord!
 

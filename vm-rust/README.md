@@ -32,6 +32,10 @@ templates and usages of `wasm-pack`.
 
 ## 🚴 Usage
 
+This repository builds with Rust 1.95.0, the `wasm32-unknown-unknown` rustup
+target, and wasm-pack 0.14.0. The authoritative setup and version-check
+commands are in the [repository README](../README.md#requirements).
+
 ### 🐑 Use `cargo generate` to Clone this Template
 
 [Learn more about `cargo generate` here.](https://github.com/ashleygwilliams/cargo-generate)
@@ -41,10 +45,11 @@ cargo generate --git https://github.com/rustwasm/wasm-pack-template.git --name m
 cd my-project
 ```
 
-### 🛠️ Build with `wasm-pack build`
+### 🛠️ Build with the pinned toolchain
 
 ```
-wasm-pack build
+cd ..
+npm run build-vm
 ```
 
 ### 🔬 Test in Headless Browsers with `wasm-pack test`

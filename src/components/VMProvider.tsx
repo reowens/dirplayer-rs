@@ -87,7 +87,7 @@ export default function VMProvider({ children, systemFontPath, wasmUrl }: VMProv
           try {
             const mcpServer = initMcpServer(wasm);
             if (isMcpEnabled()) {
-              mcpServer.start();
+              await mcpServer.start();
               console.log("MCP server initialized");
             }
           } catch (err) {

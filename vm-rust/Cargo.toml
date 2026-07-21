@@ -6,6 +6,7 @@ description = "A web-compatible Shockwave Player emulator written in Rust"
 repository = "https://github.com/igorlira/dirplayer-rs"
 license = "GPL-3.0-only"
 edition = "2024"
+rust-version = "1.95.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

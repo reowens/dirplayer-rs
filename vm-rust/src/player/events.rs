@@ -106,7 +106,7 @@ pub async fn player_dispatch_event_to_sprite_targeted(
     handler_name: &str,
     args: &Vec<DatumRef>,
     sprite_num: u16,
-) {
+) -> Result<(), ScriptError> {
     let instance_ids = reserve_player_ref(|player| {
         // Check the cache first — it may contain extra instances added
         // via scriptInstanceList.add() (e.g. goal parent scripts).
@@ -129,7 +129,7 @@ pub async fn player_dispatch_event_to_sprite_targeted(
             .map(|sprite| sprite.script_instance_list.clone())
     });
     let Some(instance_ids) = instance_ids else {
-        return;
+        return Ok(());
     };
 
     player_wait_available().await;
@@ -139,8 +139,9 @@ pub async fn player_dispatch_event_to_sprite_targeted(
             handler_name,
             args,
             Some(&vec![instance_id].as_ref()),
-        ).await;
+        ).await?;
     }
+    Ok(())
 }
 
 pub async fn player_invoke_event_to_instances(

@@ -375,7 +375,7 @@ pub async fn run_player_command(command: PlayerVMCommand) -> Result<DatumRef, Sc
                     &"mouseDown".to_string(),
                     &vec![],
                     sprite_num,
-                ).await;
+                ).await?;
             } else {
                 player_invoke_frame_and_movie_scripts(
                     &"mouseDown".to_string(),
@@ -561,7 +561,7 @@ pub async fn run_player_command(command: PlayerVMCommand) -> Result<DatumRef, Sc
                         &event_name.to_string(),
                         &vec![],
                         *sprite_num as u16,
-                    ).await;
+                    ).await?;
                     true
                 } else {
                     false
@@ -574,7 +574,7 @@ pub async fn run_player_command(command: PlayerVMCommand) -> Result<DatumRef, Sc
                 player_invoke_frame_and_movie_scripts(
                     &event_name.to_string(),
                     &vec![]
-                ).await;
+                ).await?;
             }
 
             // Execute cast member script using the ORIGINAL sprite that had mouseDown,

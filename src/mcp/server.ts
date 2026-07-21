@@ -32,8 +32,14 @@ interface McpResponse {
 // MCP Server implementation
 export class McpServer {
   private wasm: WasmModule | null = null;
-  private ws: WebSocket | null = null;
-  private requestHandler: ((_event: any, data: { requestId: string; request: McpRequest }) => void) | null = null;
+  private removeRequestHandler: (() => void) | null = null;
+  private removeCancelHandler: (() => void) | null = null;
+  private removeStatusHandler: (() => void) | null = null;
+  private activeRequestIds = new Set<string>();
+  private cancelledRequestIds = new Set<string>();
+  private workTail: Promise<void> = Promise.resolve();
+  private status: McpTransportStatus = { state: 'off' };
+  private statusListeners = new Set<(status: McpTransportStatus) => void>();
   private serverInfo = {
     name: 'dirplayer-vm',
     version: '1.0.0',
@@ -43,34 +49,54 @@ export class McpServer {
     this.wasm = wasm;
   }
 
-  async start(): Promise<void> {
-    // In the browser/Electron renderer context, we can't create an HTTP server directly.
-    // Instead, we communicate with the main process which hosts the HTTP server.
+  private updateStatus(status: McpTransportStatus) {
+    this.status = status;
+    this.statusListeners.forEach((listener) => listener(status));
+  }
 
-    // Check if we're in Electron
-    if (typeof window !== 'undefined' && (window as any).require) {
-      const { ipcRenderer } = (window as any).require('electron');
+  getStatus(): McpTransportStatus {
+    return this.status;
+  }
 
-      // Request the main process to start the HTTP server
-      ipcRenderer.send('mcp:start-server', { port: getMcpPort() });
+  subscribeStatus(listener: (status: McpTransportStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    listener(this.status);
+    return () => this.statusListeners.delete(listener);
+  }
 
-      // Remove any existing listener before adding a new one
-      if (this.requestHandler) {
-        ipcRenderer.removeListener('mcp:request', this.requestHandler);
-      }
-
-      // Listen for incoming MCP requests from the main process
-      this.requestHandler = (_event: any, data: { requestId: string; request: McpRequest }) => {
-        this.handleRequest(data.request).then((response) => {
-          ipcRenderer.send('mcp:response', { requestId: data.requestId, response });
-        });
-      };
-      ipcRenderer.on('mcp:request', this.requestHandler);
-
-      console.log(`MCP server bridge initialized, requesting main process to listen on ${getMcpUrl()}`);
-    } else {
-      console.warn('MCP server can only run in Electron environment');
+  async start(): Promise<McpTransportStatus> {
+    const bridge = window.dirplayerElectron?.mcp;
+    if (!bridge) {
+      const status: McpTransportStatus = { state: 'error', message: 'MCP requires Electron' };
+      this.updateStatus(status);
+      return status;
     }
+
+    this.removeRequestHandler?.();
+    this.removeCancelHandler?.();
+    this.removeStatusHandler?.();
+    this.removeRequestHandler = bridge.onRequest((data) => {
+      const request = data.request as McpRequest;
+      this.activeRequestIds.add(data.requestId);
+      const work = this.workTail.then(() => this.handleRequest(request));
+      this.workTail = work.then(() => undefined, () => undefined);
+      work.then((response) => {
+        this.activeRequestIds.delete(data.requestId);
+        this.cancelledRequestIds.delete(data.requestId);
+        // Main still needs completion after a client timeout so it can retain
+        // the concurrency slot until the underlying VM work actually settles.
+        bridge.sendResponse(data.requestId, response);
+      });
+    });
+    this.removeCancelHandler = bridge.onCancel((requestId) => {
+      if (this.activeRequestIds.has(requestId)) this.cancelledRequestIds.add(requestId);
+    });
+    this.removeStatusHandler = bridge.onStatus((status) => this.updateStatus(status));
+
+    this.updateStatus({ state: 'starting', host: '127.0.0.1', port: getMcpPort() });
+    const status = await bridge.start(getMcpPort());
+    this.updateStatus(status);
+    return status;
   }
 
   private async handleRequest(request: McpRequest): Promise<McpResponse> {
@@ -319,15 +345,19 @@ export class McpServer {
     }
   }
 
-  stop() {
-    if (typeof window !== 'undefined' && (window as any).require) {
-      const { ipcRenderer } = (window as any).require('electron');
-      ipcRenderer.send('mcp:stop-server');
-      if (this.requestHandler) {
-        ipcRenderer.removeListener('mcp:request', this.requestHandler);
-        this.requestHandler = null;
-      }
-    }
+  async stop(): Promise<McpTransportStatus> {
+    this.activeRequestIds.clear();
+    this.cancelledRequestIds.clear();
+    this.removeRequestHandler?.();
+    this.removeCancelHandler?.();
+    this.removeStatusHandler?.();
+    this.removeRequestHandler = null;
+    this.removeCancelHandler = null;
+    this.removeStatusHandler = null;
+    const bridge = window.dirplayerElectron?.mcp;
+    const status = bridge ? await bridge.stop() : { state: 'off' as const };
+    this.updateStatus(status);
+    return status;
   }
 }
 
@@ -360,8 +390,7 @@ export function setMcpPort(port: number): void {
   // Restart server if currently running
   if (isMcpEnabled()) {
     const server = getMcpServer();
-    server.stop();
-    server.start();
+    void server.stop().then(() => server.start());
   }
 }
 
@@ -378,12 +407,20 @@ export function isMcpEnabled(): boolean {
   return window.localStorage.getItem(MCP_ENABLED_KEY) === 'true';
 }
 
-export function setMcpEnabled(enabled: boolean): void {
+export async function setMcpEnabled(enabled: boolean): Promise<McpTransportStatus> {
   window.localStorage.setItem(MCP_ENABLED_KEY, enabled ? 'true' : 'false');
   const server = getMcpServer();
   if (enabled) {
-    server.start();
+    return server.start();
   } else {
-    server.stop();
+    return server.stop();
   }
+}
+
+export function getMcpStatus(): McpTransportStatus {
+  return getMcpServer().getStatus();
+}
+
+export function subscribeMcpStatus(listener: (status: McpTransportStatus) => void): () => void {
+  return getMcpServer().subscribeStatus(listener);
 }

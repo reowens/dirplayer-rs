@@ -4,6 +4,13 @@ import './index.css';
 import App from './App';
 import reportWebVitals from './reportWebVitals';
 import { initializeNetLoader } from './services/netLoader';
+import { installProxyWebSocketAuth } from './services/proxyAuth';
+
+const proxyToken = process.env.REACT_APP_DIRPLAYER_PROXY_TOKEN;
+if (proxyToken) {
+  window.dirplayerProxyToken = proxyToken;
+  installProxyWebSocketAuth(proxyToken);
+}
 
 // Initialize network loader for Electron support
 initializeNetLoader();

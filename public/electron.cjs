@@ -1,199 +1,245 @@
 const electron = require('electron');
-const app = electron.app;
-const BrowserWindow = electron.BrowserWindow;
-const ipcMain = electron.ipcMain;
-const dialog = electron.dialog;
-
+const { app, BrowserWindow, dialog, ipcMain } = electron;
 const path = require('path');
+const { pathToFileURL } = require('url');
 const fs = require('fs');
 const isDev = require('electron-is-dev').default;
-const http = require('http');
+const { createMcpHttpServer, jsonRpcError } = require('./control-http.cjs');
+const { isTrustedRendererUrl, secureWebPreferences } = require('./electron-policy.cjs');
+const { folderGrantPrompt, isPathGranted } = require('./file-access-policy.cjs');
+const {
+  parseAllowedOrigins,
+  resolveRunToken,
+} = require('./control-security.cjs');
+
+const MAX_LOCAL_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_MCP_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 let mainWindow;
-let mcpServer = null;
-let pendingRequests = new Map(); // requestId -> response object
+let trustedRendererUrl;
+let mcpService = null;
+let mcpStatus = { state: 'off' };
+let mcpRestartRequired = false;
 let requestIdCounter = 0;
+const pendingRendererRequests = new Map();
+const grantedFileRoots = new Set();
+
+function publishMcpStatus(status) {
+  mcpStatus = status;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('mcp:status', status);
+  }
+  return status;
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 900,
     height: 680,
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
-    }
+    webPreferences: secureWebPreferences(path.join(__dirname, 'preload.cjs')),
   });
-  mainWindow.loadURL(isDev ? 'http://localhost:3000' : `file://${path.join(__dirname, '../build/index.html')}`);
-  mainWindow.on('closed', () => mainWindow = null);
+  trustedRendererUrl = isDev
+    ? 'http://localhost:3000'
+    : pathToFileURL(path.join(__dirname, '../build/index.html')).href;
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedRendererUrl(url, trustedRendererUrl, isDev)) event.preventDefault();
+  });
+  mainWindow.loadURL(trustedRendererUrl);
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
 }
 
-app.on('ready', createWindow);
+function isTrustedSender(event) {
+  return Boolean(
+    mainWindow
+    && !mainWindow.isDestroyed()
+    && event.sender === mainWindow.webContents
+    && event.senderFrame === mainWindow.webContents.mainFrame
+    && isTrustedRendererUrl(event.senderFrame.url, trustedRendererUrl, isDev)
+  );
+}
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
+function requireTrustedSender(event) {
+  if (!isTrustedSender(event)) throw new Error('Untrusted IPC sender');
+}
+
+async function readGrantedFile(filePath) {
+  if (typeof filePath !== 'string' || filePath.length === 0 || filePath.length > 4096) {
+    throw new Error('Invalid file path');
   }
-});
-
-app.on('activate', () => {
-  if (mainWindow === null) {
-    createWindow();
+  const realPath = await fs.promises.realpath(filePath);
+  if (!isPathGranted(realPath, grantedFileRoots)) {
+    throw new Error('File is outside a user-approved directory');
   }
-});
+  const stats = await fs.promises.stat(realPath);
+  if (!stats.isFile()) throw new Error('Path is not a file');
+  if (stats.size > MAX_LOCAL_FILE_BYTES) throw new Error('File exceeds local read limit');
+  return fs.promises.readFile(realPath);
+}
 
-// IPC handlers for file operations
-ipcMain.handle('dialog:openFile', async () => {
+ipcMain.handle('dialog:openFile', async (event) => {
+  requireTrustedSender(event);
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile'],
     filters: [
       { name: 'Director Movies', extensions: ['dir', 'dxr', 'dcr'] },
-      { name: 'All Files', extensions: ['*'] }
-    ]
+      { name: 'All Files', extensions: ['*'] },
+    ],
   });
-
-  if (!result.canceled && result.filePaths.length > 0) {
-    return result.filePaths[0];
-  }
-  return null;
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const selectedPath = await fs.promises.realpath(result.filePaths[0]);
+  const folder = path.dirname(selectedPath);
+  const confirmation = await dialog.showMessageBox(mainWindow, folderGrantPrompt(folder));
+  if (confirmation.response !== 0) return null;
+  grantedFileRoots.add(folder);
+  return selectedPath;
 });
 
-// Read file from local filesystem
-ipcMain.handle('fs:readFile', async (_event, filePath) => {
+ipcMain.handle('fs:readFile', async (event, filePath) => {
+  requireTrustedSender(event);
   try {
-    const data = fs.readFileSync(filePath);
-    return { success: true, data: Array.from(data) };
+    const data = await readGrantedFile(filePath);
+    return { success: true, data };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : 'File read failed' };
   }
 });
 
-// ============================================================================
-// MCP HTTP Server for VM debugging
-// ============================================================================
+function rejectPendingRendererRequests(message) {
+  for (const [requestId, pending] of pendingRendererRequests) {
+    pending.signal.removeEventListener('abort', pending.onAbort);
+    pending.reject(new Error(message));
+    pendingRendererRequests.delete(requestId);
+  }
+}
 
-function startMcpServer(port) {
-  if (mcpServer) {
-    console.log('MCP server already running');
+function dispatchToRenderer(request, { signal }) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return Promise.resolve(jsonRpcError(request.id, -32603, 'VM not available'));
+  }
+  const requestId = `req_${++requestIdCounter}`;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      if (!pendingRendererRequests.has(requestId)) return;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('mcp:cancel', requestId);
+      }
+    };
+    pendingRendererRequests.set(requestId, { resolve, reject, onAbort, signal });
+    signal.addEventListener('abort', onAbort, { once: true });
+    mainWindow.webContents.send('mcp:request', { requestId, request });
+  });
+}
+
+async function startMcpServer(port) {
+  if (mcpRestartRequired) {
+    return publishMcpStatus({
+      state: 'error',
+      restartRequired: true,
+      message: 'MCP timed out while VM work was still running. Restart DirPlayer before enabling MCP again.',
+    });
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return publishMcpStatus({ state: 'error', message: 'Invalid MCP port' });
+  }
+  if (mcpService) return mcpStatus;
+
+  publishMcpStatus({ state: 'starting', host: '127.0.0.1', port });
+  try {
+    const token = resolveRunToken('DIRPLAYER_MCP_TOKEN');
+    const allowedOrigins = parseAllowedOrigins(process.env.DIRPLAYER_MCP_ALLOWED_ORIGINS);
+    const service = createMcpHttpServer({
+      token,
+      allowedOrigins,
+      handleRequest: dispatchToRenderer,
+      onDegraded: (message) => {
+        if (mcpService !== service) return;
+        mcpRestartRequired = true;
+        publishMcpStatus({ state: 'error', restartRequired: true, message });
+      },
+    });
+    mcpService = service;
+    await service.listen(port, '127.0.0.1');
+    service.server.on('error', (error) => {
+      if (mcpService !== service) return;
+      console.error('MCP server error:', error);
+      mcpService = null;
+      rejectPendingRendererRequests('MCP server failed');
+      void service.close().finally(() => {
+        publishMcpStatus({ state: 'error', message: error.message });
+      });
+    });
+    console.log(`MCP server listening on http://127.0.0.1:${port}`);
+    console.log(`MCP bearer token: ${token}`);
+    return publishMcpStatus({
+      state: 'listening',
+      host: '127.0.0.1',
+      port,
+      token,
+    });
+  } catch (error) {
+    if (mcpService) await mcpService.close().catch(() => {});
+    mcpService = null;
+    const message = error instanceof Error ? error.message : 'Failed to start MCP server';
+    console.error('MCP server error:', error);
+    return publishMcpStatus({ state: 'error', message });
+  }
+}
+
+async function stopMcpServer() {
+  const service = mcpService;
+  mcpService = null;
+  rejectPendingRendererRequests('MCP server stopping');
+  if (service) await service.close();
+  console.log('MCP server stopped');
+  if (mcpRestartRequired) return mcpStatus;
+  return publishMcpStatus({ state: 'off' });
+}
+
+ipcMain.handle('mcp:start-server', async (event, value) => {
+  requireTrustedSender(event);
+  return startMcpServer(value?.port);
+});
+
+ipcMain.handle('mcp:stop-server', async (event) => {
+  requireTrustedSender(event);
+  return stopMcpServer();
+});
+
+ipcMain.on('mcp:response', (event, value) => {
+  if (!isTrustedSender(event)) return;
+  const requestId = value?.requestId;
+  const pending = typeof requestId === 'string' ? pendingRendererRequests.get(requestId) : null;
+  if (!pending) return;
+  pending.signal.removeEventListener('abort', pending.onAbort);
+  let serialized;
+  try {
+    serialized = JSON.stringify(value.response);
+  } catch (_error) {
+    pending.reject(new Error('Renderer returned an invalid response'));
+    pendingRendererRequests.delete(requestId);
     return;
   }
-
-  try {
-    mcpServer = http.createServer((req, res) => {
-      // Set CORS headers
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-      if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
-      }
-
-      if (req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => {
-          body += chunk.toString();
-        });
-
-        req.on('end', () => {
-          try {
-            const request = JSON.parse(body);
-            const requestId = `req_${++requestIdCounter}`;
-
-            // Store the response object to send the response later
-            pendingRequests.set(requestId, res);
-
-            // Forward request to renderer process
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('mcp:request', { requestId, request });
-            } else {
-              res.writeHead(503, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({
-                jsonrpc: '2.0',
-                id: request.id || null,
-                error: { code: -32603, message: 'VM not available' }
-              }));
-              pendingRequests.delete(requestId);
-            }
-
-            // Timeout after 30 seconds
-            setTimeout(() => {
-              if (pendingRequests.has(requestId)) {
-                const pendingRes = pendingRequests.get(requestId);
-                pendingRes.writeHead(504, { 'Content-Type': 'application/json' });
-                pendingRes.end(JSON.stringify({
-                  jsonrpc: '2.0',
-                  id: request.id || null,
-                  error: { code: -32603, message: 'Request timeout' }
-                }));
-                pendingRequests.delete(requestId);
-              }
-            }, 30000);
-
-          } catch (error) {
-            console.error('Error parsing MCP request:', error);
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              jsonrpc: '2.0',
-              id: null,
-              error: { code: -32700, message: 'Parse error' }
-            }));
-          }
-        });
-      } else {
-        // GET request - return server info
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          name: 'dirplayer-vm',
-          version: '1.0.0',
-          protocolVersion: '2024-11-05'
-        }));
-      }
-    });
-
-    mcpServer.listen(port, () => {
-      console.log(`MCP server listening on http://localhost:${port}`);
-    });
-
-    mcpServer.on('error', (error) => {
-      console.error('MCP server error:', error);
-      mcpServer = null;
-    });
-
-  } catch (error) {
-    console.error('Failed to start MCP server:', error);
+  if (Buffer.byteLength(serialized) > MAX_MCP_RESPONSE_BYTES) {
+    pending.reject(new Error('Renderer response exceeds limit'));
+  } else {
+    pending.resolve(value.response);
   }
-}
-
-function stopMcpServer() {
-  if (mcpServer) {
-    mcpServer.close();
-    mcpServer = null;
-    pendingRequests.clear();
-    console.log('MCP server stopped');
-  }
-}
-
-// IPC handlers for MCP server
-ipcMain.on('mcp:start-server', (_event, { port }) => {
-  startMcpServer(port);
+  pendingRendererRequests.delete(requestId);
 });
 
-ipcMain.on('mcp:stop-server', () => {
-  stopMcpServer();
+app.on('ready', createWindow);
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
 });
 
-ipcMain.on('mcp:response', (_event, { requestId, response }) => {
-  const res = pendingRequests.get(requestId);
-  if (res) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(response));
-    pendingRequests.delete(requestId);
-  }
+app.on('activate', () => {
+  if (mainWindow === null) createWindow();
 });
 
-// Clean up MCP server on app quit
 app.on('before-quit', () => {
-  stopMcpServer();
+  void stopMcpServer();
 });

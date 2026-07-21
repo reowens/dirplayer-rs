@@ -1,6 +1,5 @@
 #!/bin/sh
 set -e
 
-cd vm-rust
-wasm-pack build --target web --release
-cd ..
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+node "$SCRIPT_DIR/run-wasm-pack.cjs" build --target web --release

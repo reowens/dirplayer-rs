@@ -1,6 +1,6 @@
 use async_std::{channel::Sender, task::spawn_local};
 use fxhash::FxHashMap;
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
 // Use console::warn_1 directly for debugging since log level is set to Error
@@ -142,7 +142,18 @@ impl MultiuserXtraManager {
                 let ws_url = format!("{}://{}:{}", ws_scheme, host, port);
                 multiuser_log!("Multiuser: Connecting to WebSocket URL: {} (user={}, movie={})", ws_url, username, movie_id);
 
-                let socket = match WebSocket::new(&ws_url) {
+                let token = web_sys::window()
+                    .and_then(|window| js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("dirplayerProxyToken")).ok())
+                    .and_then(|value| value.as_string());
+                let socket_result = if let Some(token) = token {
+                    let protocols = js_sys::Array::new();
+                    protocols.push(&JsValue::from_str("dirplayer-v1"));
+                    protocols.push(&JsValue::from_str(&format!("dirplayer-bearer.{token}")));
+                    WebSocket::new_with_str_sequence(&ws_url, protocols.as_ref())
+                } else {
+                    Err(JsValue::from_str("Missing run-scoped proxy token; start with npm run start:proxy"))
+                };
+                let socket = match socket_result {
                     Ok(s) => s,
                     Err(e) => {
                         multiuser_log!("Multiuser: Failed to create WebSocket: {:?}", e);
