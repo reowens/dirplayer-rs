@@ -51,13 +51,17 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::{mcp_get_cast_member_picture, mcp_get_cast_member_picture_with_palette};
+use vm_rust::player::mcp::{
+    collect_palette_table, mcp_get_cast_member_picture, mcp_get_cast_member_picture_with_palette,
+    palettes_manifest_json,
+};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -326,6 +330,12 @@ async fn dump_inner() {
 
     let mut summary: Vec<String> = Vec::new();
     let mut studios_meta: Vec<serde_json::Value> = Vec::new();
+    // Deduplicated CLUTs, keyed by the same `paletteRef` string the sidecar
+    // entries carry. Written once as `_studio_palettes.json` — named apart
+    // from `dump_cct_bitmaps`'s `_palettes.json` because both dumpers share
+    // `rooms_output_dir()`. Members dumped through a palette override
+    // register the overridden (effective) CLUT, not the declared one.
+    let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
     summary.push(format!(
         "  loaded cc_studio.cct → {} bitmap members indexed",
@@ -353,6 +363,8 @@ async fn dump_inner() {
                 continue;
             }
         };
+
+        collect_palette_table(&mut palette_tables, &parsed);
 
         let Some((bytes, w, h)) = decode_png(&json) else {
             let first_line = json.lines().next().unwrap_or("(empty)");
@@ -386,6 +398,7 @@ async fn dump_inner() {
             "originalBitDepth": parsed.get("original_bit_depth"),
             "useAlpha": parsed.get("use_alpha"),
             "paletteRef": parsed.get("palette_ref"),
+            "paletteIndexed": parsed.get("palette_indexed"),
             "width": parsed.get("width"),
             "height": parsed.get("height"),
         }));
@@ -472,6 +485,9 @@ async fn dump_inner() {
             } else {
                 reserve_player_ref(|player| mcp_get_cast_member_picture(player, cl, cm))
             };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                collect_palette_table(&mut palette_tables, &v);
+            }
             let Some((bytes, _w, _h)) = decode_png(&json) else {
                 dir_misses.push(format!("{} (png decode failed)", member_name));
                 continue;
@@ -547,6 +563,7 @@ async fn dump_inner() {
             fs::write(out, &bytes).ok();
         }
         if let Some(v) = parsed {
+            collect_palette_table(&mut palette_tables, &v);
             if !name.is_empty() {
                 all_members_meta.push(serde_json::json!({
                     "name": name,
@@ -558,6 +575,7 @@ async fn dump_inner() {
                     "originalBitDepth": v.get("original_bit_depth"),
                     "useAlpha": v.get("use_alpha"),
                     "paletteRef": v.get("palette_ref"),
+                    "paletteIndexed": v.get("palette_indexed"),
                     "width": v.get("width"),
                     "height": v.get("height"),
                 }));
@@ -574,6 +592,17 @@ async fn dump_inner() {
             path
         ));
     }
+    let palettes_path = format!("{}/_studio_palettes.json", rooms_output_dir());
+    fs::write(
+        &palettes_path,
+        palettes_manifest_json("dump_studio_bitmaps", &palette_tables),
+    )
+    .expect("write _studio_palettes.json");
+    summary.push(format!(
+        "    _studio_palettes.json: {} distinct CLUTs → {}",
+        palette_tables.len(),
+        palettes_path
+    ));
     summary.push(format!(
         "    scratch dump: {} bitmaps → {}",
         all_bitmaps.len(),

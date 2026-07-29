@@ -22,7 +22,10 @@ use base64::Engine;
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::mcp_get_cast_member_picture;
+use vm_rust::player::mcp::{
+    build_palette_table, collect_palette_table, mcp_get_cast_member_picture,
+    palettes_manifest_json,
+};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -54,6 +57,11 @@ async fn dump_inner() {
         .map(|root| read_custom_inks(&PathBuf::from(root).join("custominks.txt")))
         .unwrap_or_default();
     let mut extracted_by_cast: HashMap<String, BTreeSet<String>> = HashMap::new();
+    // Deduplicated CLUTs across both avatar casts, keyed by the same
+    // `paletteRef` string every `_members.json` entry carries. 2,435 members
+    // share a handful of tables, so this is emitted once at the avatars root
+    // as `_palettes.json` rather than inlined per member (~7 MB saved).
+    let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
     for (cct_name, output_name) in AVATAR_CASTS {
         let cct_path = PathBuf::from(casts_root()).join(cct_name);
@@ -146,8 +154,16 @@ async fn dump_inner() {
                 format!("{name}__cast{cast_lib}_{cast_member}")
             };
             if declared_width == 0 || declared_height == 0 {
-                let (reg_x, reg_y, bit_depth, original_bit_depth, use_alpha, palette_ref) =
-                    reserve_player_ref(|player| {
+                let (
+                    reg_x,
+                    reg_y,
+                    bit_depth,
+                    original_bit_depth,
+                    use_alpha,
+                    palette_ref,
+                    palette_indexed,
+                    palette_table,
+                ) = reserve_player_ref(|player| {
                         let cast = player
                             .movie
                             .cast_manager
@@ -163,6 +179,16 @@ async fn dump_inner() {
                             .bitmap_manager
                             .get_bitmap(bitmap_member.image_ref)
                             .expect("empty bitmap data");
+                        // 0x0 placeholders never reach the MCP picture path,
+                        // so resolve their CLUT here too — otherwise their
+                        // `paletteRef` would dangle in `_palettes.json`.
+                        let palette_table = bitmap.has_palette().then(|| {
+                            serde_json::to_value(build_palette_table(
+                                player,
+                                &bitmap.palette_ref,
+                            ))
+                            .expect("serialize palette table")
+                        });
                         (
                             bitmap_member.reg_point.0,
                             bitmap_member.reg_point.1,
@@ -170,8 +196,17 @@ async fn dump_inner() {
                             bitmap.original_bit_depth,
                             bitmap.use_alpha,
                             format!("{:?}", bitmap.palette_ref),
+                            bitmap.has_palette(),
+                            palette_table,
                         )
                     });
+                if let Some(table) = &palette_table {
+                    if let Some(key) = table.get("key").and_then(|v| v.as_str()) {
+                        palette_tables
+                            .entry(key.to_string())
+                            .or_insert_with(|| table.clone());
+                    }
+                }
                 metadata.push(serde_json::json!({
                     "name": name,
                     "key": key,
@@ -185,6 +220,7 @@ async fn dump_inner() {
                     "originalBitDepth": original_bit_depth,
                     "useAlpha": use_alpha,
                     "paletteRef": palette_ref,
+                    "paletteIndexed": palette_indexed,
                     "customInk": null,
                     "width": declared_width,
                     "height": declared_height,
@@ -212,6 +248,7 @@ async fn dump_inner() {
             fs::write(png_output.join(format!("{file_stem}.png")), png)
                 .unwrap_or_else(|error| panic!("write avatar PNG {name}: {error}"));
 
+            collect_palette_table(&mut palette_tables, &parsed);
             let custom_ink = custom_inks
                 .iter()
                 .find(|(key, _)| name.contains(&format!("_{key}_")))
@@ -229,6 +266,7 @@ async fn dump_inner() {
                 "originalBitDepth": parsed.get("original_bit_depth"),
                 "useAlpha": parsed.get("use_alpha"),
                 "paletteRef": parsed.get("palette_ref"),
+                "paletteIndexed": parsed.get("palette_indexed"),
                 "customInk": custom_ink,
                 "width": parsed.get("width"),
                 "height": parsed.get("height"),
@@ -256,6 +294,18 @@ async fn dump_inner() {
         assert_eq!(total_bitmaps, metadata.len() + unnamed_bitmaps);
         extracted_by_cast.insert((*output_name).to_string(), extracted_names);
     }
+
+    let palettes_path = output_root().join("_palettes.json");
+    fs::write(
+        &palettes_path,
+        palettes_manifest_json("dump_avatar_bitmaps", &palette_tables),
+    )
+    .expect("write avatar _palettes.json");
+    println!(
+        "palettes: {} distinct CLUTs -> {}",
+        palette_tables.len(),
+        palettes_path.display()
+    );
 
     if let Ok(utm_root) = std::env::var("UTM_PARTS_ROOT") {
         let people_names = extracted_by_cast

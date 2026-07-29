@@ -1,6 +1,7 @@
 // MCP (Model Context Protocol) query functions for VM debugging
 // These functions return JSON strings for use with the MCP server
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use fxhash::FxHashMap;
@@ -15,6 +16,10 @@ use crate::{director::{
 
 use super::{
     allocator::{DatumAllocatorTrait, ScriptInstanceAllocatorTrait},
+    bitmap::bitmap::{
+        get_system_default_palette, lookup_palette_member, resolve_palette_table, PaletteRef,
+    },
+    bitmap::palette_map::PaletteMap,
     cast_lib::{CastLib, CastMemberRef},
     cast_member::CastMemberType,
     datum_ref::DatumId,
@@ -232,12 +237,199 @@ pub struct McpCastMemberPicture {
     pub reg_y: i16,
     pub use_alpha: bool,
     pub palette_ref: String,
+    /// True when the member's storage is indexed, i.e. the CLUT below is what
+    /// the pixels were resolved through. 16/32-bit members carry direct RGB
+    /// pixels; for those `palette` is `null` and `palette_ref` is inert.
+    pub palette_indexed: bool,
+    /// The resolved 256-entry CLUT actually used for this render (including a
+    /// palette override, when one was requested). `null` for direct-color
+    /// members. Dumpers dedupe these by `key` into a single `_palettes.json`
+    /// rather than inlining a table per member.
+    pub palette: Option<McpPaletteTable>,
     /// Length of the underlying RGBA buffer in bytes.
     pub data_len: usize,
     /// First 64 bytes of the bitmap's `data` buffer, hex-encoded — diagnostic.
     pub data_head_hex: String,
     /// Base64-encoded PNG. RGBA pixels resolved via the bitmap's palette.
     pub png_base64: String,
+}
+
+/// A fully resolved 256-entry CLUT (palette contents), shaped for direct
+/// pass-through into a dumper's `_palettes.json`.
+///
+/// Field names are camelCase — unlike every other MCP response type here —
+/// precisely because dumpers copy this object onto disk verbatim instead of
+/// re-mapping it field by field in seven places.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPaletteTable {
+    /// Join key. Byte-identical to the `paletteRef` string that bitmap
+    /// sidecars already carry, so a member joins to its CLUT with no new field.
+    pub key: String,
+    /// `"builtIn"` | `"member"` | `"default"`.
+    pub kind: String,
+    /// Built-in palette name. Present for `builtIn`, and for `default` it names
+    /// the platform palette that "no palette set" resolves to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_in: Option<String>,
+    /// Palette cast member coordinates, for `kind == "member"`. `castLib` 0
+    /// means "search every cast lib by member number".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast_lib: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast_member: Option<i32>,
+    /// Name of the palette cast member, when it could be looked up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_name: Option<String>,
+    /// For `kind == "member"`: `"exact"`, `"castLibFallback"` or `"missing"`.
+    /// Anything other than `"exact"` means these entries are a substitution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// The 256 entries as lowercase `"rrggbb"`, index-aligned to the palette
+    /// index (`entries[0]` is the index-0 background/key color).
+    pub entries: Vec<String>,
+    /// Built-in palettes swap in a 16-color table for 4-bit originals (and a
+    /// 4-color one for 2-bit GrayScale), so one `key` can yield different
+    /// CLUTs at those depths. Keyed by the member sidecar's `originalBitDepth`;
+    /// only depths whose table actually differs from `entries` appear. A
+    /// consumer should prefer `depthEntries[originalBitDepth]` when present.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub depth_entries: BTreeMap<String, Vec<String>>,
+}
+
+fn hex_entries(table: &[(u8, u8, u8)]) -> Vec<String> {
+    table
+        .iter()
+        .map(|(r, g, b)| format!("{:02x}{:02x}{:02x}", r, g, b))
+        .collect()
+}
+
+/// Resolve `palette_ref` into an exportable CLUT.
+///
+/// Deliberately a pure function of (movie palettes, `palette_ref`) and never of
+/// the member that triggered it: every member sharing a `paletteRef` therefore
+/// produces a byte-identical table, which is what makes the dumpers' dedupe
+/// order-independent (and the emitted file diff-stable run to run).
+pub fn build_palette_table(player: &DirPlayer, palette_ref: &PaletteRef) -> McpPaletteTable {
+    let palettes = player.movie.cast_manager.palettes();
+    let member_name = match palette_ref {
+        PaletteRef::Member(member_ref) if member_ref.cast_lib > 0 => player
+            .movie
+            .cast_manager
+            .get_cast(member_ref.cast_lib as u32)
+            .ok()
+            .and_then(|cast| cast.members.get(&(member_ref.cast_member as u32)))
+            .map(|member| member.name.clone())
+            .filter(|name| !name.is_empty()),
+        _ => None,
+    };
+    build_palette_table_from(&palettes, palette_ref, member_name)
+}
+
+/// `build_palette_table` without the `DirPlayer`, so the CLUT resolution can be
+/// exercised against a hand-built `PaletteMap`. `member_name` is the palette
+/// cast member's name when the caller could look it up.
+pub fn build_palette_table_from(
+    palettes: &PaletteMap,
+    palette_ref: &PaletteRef,
+    member_name: Option<String>,
+) -> McpPaletteTable {
+    // `entries` is the 8-bit resolution; the 2/4-bit built-in variants ride
+    // along in `depth_entries` only when they actually differ.
+    let entries = hex_entries(&resolve_palette_table(palettes, palette_ref, 8));
+    let mut depth_entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for depth in [2u8, 4u8] {
+        let variant = hex_entries(&resolve_palette_table(palettes, palette_ref, depth));
+        if variant != entries {
+            depth_entries.insert(depth.to_string(), variant);
+        }
+    }
+
+    let mut table = McpPaletteTable {
+        key: format!("{:?}", palette_ref),
+        kind: String::new(),
+        built_in: None,
+        cast_lib: None,
+        cast_member: None,
+        member_name: None,
+        resolution: None,
+        entries,
+        depth_entries,
+    };
+
+    match palette_ref {
+        PaletteRef::BuiltIn(palette) => {
+            table.kind = "builtIn".to_string();
+            table.built_in = Some(format!("{:?}", palette));
+        }
+        PaletteRef::Default => {
+            table.kind = "default".to_string();
+            table.built_in = Some(format!("{:?}", get_system_default_palette()));
+        }
+        PaletteRef::Member(member_ref) => {
+            table.kind = "member".to_string();
+            table.cast_lib = Some(member_ref.cast_lib);
+            table.cast_member = Some(member_ref.cast_member);
+            table.resolution =
+                Some(lookup_palette_member(palettes, member_ref).1.as_str().to_string());
+            table.member_name = member_name;
+        }
+    }
+    table
+}
+
+/// Fold the `palette` object of an MCP picture response into a dedupe map.
+///
+/// Keyed by the palette's `key` (== the response's `palette_ref`), so the 2,435
+/// avatar members that share a handful of CLUTs cost a handful of entries on
+/// disk instead of ~7 MB of duplicated tables. No-op for direct-color members.
+pub fn collect_palette_table(
+    sink: &mut BTreeMap<String, serde_json::Value>,
+    picture: &serde_json::Value,
+) {
+    let Some(palette) = picture.get("palette") else {
+        return;
+    };
+    if palette.is_null() {
+        return;
+    }
+    let Some(key) = palette.get("key").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if !sink.contains_key(key) {
+        sink.insert(key.to_string(), palette.clone());
+    }
+}
+
+/// Serialize a collected palette map as a `_palettes.json` body.
+///
+/// `BTreeMap` key order (and `serde_json::Map`'s own ordering) makes the output
+/// byte-stable across runs — the same determinism guarantee the skip summaries
+/// carry.
+pub fn palettes_manifest_json(
+    dumper: &str,
+    tables: &BTreeMap<String, serde_json::Value>,
+) -> String {
+    let mut palettes = serde_json::Map::new();
+    for (key, value) in tables {
+        palettes.insert(key.clone(), value.clone());
+    }
+    let manifest = serde_json::json!({
+        "version": 1,
+        "dumper": dumper,
+        "note": "Resolved CLUT contents, deduplicated. Join a bitmap sidecar to \
+                 its palette with the sidecar's `paletteRef` field as the key \
+                 here; `entries[i]` is the RGB for palette index i as lowercase \
+                 rrggbb. If the palette carries `depthEntries` and the member's \
+                 `originalBitDepth` appears there, use that table instead. \
+                 Members with `paletteIndexed: false` (16/32-bit direct color) \
+                 have no entry and their `paletteRef` is inert.",
+        "paletteCount": palettes.len(),
+        "palettes": serde_json::Value::Object(palettes),
+    });
+    serde_json::to_string_pretty(&manifest).unwrap_or_else(|e| {
+        serde_json::to_string(&McpError { error: e.to_string() }).unwrap()
+    })
 }
 
 #[derive(Serialize)]
@@ -1082,7 +1274,6 @@ fn render_picture_inner(
 ) -> String {
     use base64::Engine;
     use image::{ImageFormat, RgbaImage};
-    use crate::player::bitmap::bitmap::PaletteRef;
 
     let cast = match player.movie.cast_manager.get_cast(cast_lib as u32) {
         Ok(c) => c,
@@ -1202,6 +1393,13 @@ fn render_picture_inner(
         reg_y: effective_reg_y,
         use_alpha: bitmap.use_alpha,
         palette_ref: format!("{:?}", bitmap.palette_ref),
+        palette_indexed: bitmap.has_palette(),
+        // Resolved from `bitmap`, not `bitmap_ref`, so an overridden palette
+        // exports the CLUT the pixels above were actually drawn through rather
+        // than the member's declared one.
+        palette: bitmap
+            .has_palette()
+            .then(|| build_palette_table(player, &bitmap.palette_ref)),
         data_len: bitmap.data.len(),
         data_head_hex,
         png_base64,
@@ -1757,5 +1955,170 @@ pub fn mcp_format_eval_result(
                 error: Some(err.message),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod clut_export_tests {
+    use super::*;
+    use crate::player::bitmap::bitmap::{BuiltInPalette, PaletteMemberSource};
+    use crate::player::bitmap::palette::{
+        SYSTEM_MAC_PALETTE, SYSTEM_WIN_PALETTE, WIN_16_PALETTE,
+    };
+    use crate::player::cast_member::PaletteMember;
+    use crate::player::handlers::datum_handlers::cast_member_ref::CastMemberRefHandlers;
+
+    fn hex(color: (u8, u8, u8)) -> String {
+        format!("{:02x}{:02x}{:02x}", color.0, color.1, color.2)
+    }
+
+    /// A `palette_id=0` bitmap must export the platform default CLUT, not an
+    /// empty or fabricated one. Index 0 is the interesting entry: Director's
+    /// color-key inks key on it, so a consumer that hardcodes white needs this
+    /// table to check itself against.
+    #[test]
+    fn default_palette_exports_the_platform_default_clut() {
+        let palettes = PaletteMap::new();
+
+        let table = build_palette_table_from(&palettes, &PaletteRef::Default, None);
+
+        assert_eq!(table.key, "Default");
+        assert_eq!(table.kind, "default");
+        assert_eq!(table.built_in.as_deref(), Some("SystemWin"));
+        assert_eq!(table.entries.len(), 256);
+        assert_eq!(table.entries[0], hex(SYSTEM_WIN_PALETTE[0]));
+        assert_eq!(table.entries[1], hex(SYSTEM_WIN_PALETTE[1]));
+        assert_eq!(table.entries[255], hex(SYSTEM_WIN_PALETTE[255]));
+        assert!(table.cast_lib.is_none());
+        assert!(table.resolution.is_none());
+    }
+
+    /// Built-in palettes export their own table, and the 4-bit variant (which
+    /// swaps in a 16-color CLUT for the low indices) rides along in
+    /// `depth_entries` so one key can serve members of either depth.
+    #[test]
+    fn builtin_palette_exports_its_table_and_depth_variants() {
+        let palettes = PaletteMap::new();
+
+        let mac = build_palette_table_from(
+            &palettes,
+            &PaletteRef::BuiltIn(BuiltInPalette::SystemMac),
+            None,
+        );
+        assert_eq!(mac.key, "BuiltIn(SystemMac)");
+        assert_eq!(mac.kind, "builtIn");
+        assert_eq!(mac.built_in.as_deref(), Some("SystemMac"));
+        assert_eq!(mac.entries[0], hex(SYSTEM_MAC_PALETTE[0]));
+        assert_eq!(mac.entries[1], hex(SYSTEM_MAC_PALETTE[1]));
+
+        let win = build_palette_table_from(
+            &palettes,
+            &PaletteRef::BuiltIn(BuiltInPalette::SystemWin),
+            None,
+        );
+        // 2-bit resolves identically to 8-bit for SystemWin, 4-bit does not.
+        assert!(!win.depth_entries.contains_key("2"));
+        let four_bit = win
+            .depth_entries
+            .get("4")
+            .expect("SystemWin has a distinct 4-bit CLUT");
+        assert_eq!(four_bit.len(), 256);
+        assert_eq!(four_bit[2], hex(WIN_16_PALETTE[2]));
+        assert_ne!(four_bit[2], win.entries[2]);
+        // Indices past the 16-color table fall back to the 8-bit palette.
+        assert_eq!(four_bit[255], win.entries[255]);
+    }
+
+    /// A member palette exports its own colors and says so; a member ref that
+    /// resolves to nothing must be flagged rather than silently passed off as
+    /// a real CLUT (it is really the system default in disguise).
+    #[test]
+    fn member_palette_reports_how_it_resolved() {
+        let mut palettes = PaletteMap::new();
+        let mut colors = vec![(0u8, 0u8, 0u8); 256];
+        colors[0] = (12, 34, 56);
+        colors[255] = (200, 100, 50);
+        palettes.insert(
+            CastMemberRefHandlers::get_cast_slot_number(3, 7),
+            PaletteMember { colors },
+        );
+
+        let present = build_palette_table_from(
+            &palettes,
+            &PaletteRef::Member(CastMemberRef { cast_lib: 3, cast_member: 7 }),
+            Some("room_clut".to_string()),
+        );
+        assert_eq!(present.kind, "member");
+        assert_eq!(present.cast_lib, Some(3));
+        assert_eq!(present.cast_member, Some(7));
+        assert_eq!(present.member_name.as_deref(), Some("room_clut"));
+        assert_eq!(present.resolution.as_deref(), Some("exact"));
+        assert_eq!(present.entries[0], "0c2238");
+        assert_eq!(present.entries[255], "c86432");
+        // Custom CLUTs are depth-independent — no variant tables.
+        assert!(present.depth_entries.is_empty());
+
+        let missing = build_palette_table_from(
+            &palettes,
+            &PaletteRef::Member(CastMemberRef { cast_lib: 99, cast_member: 99 }),
+            None,
+        );
+        assert_eq!(missing.resolution.as_deref(), Some("missing"));
+        assert_eq!(missing.entries[0], hex(SYSTEM_WIN_PALETTE[0]));
+        assert_eq!(
+            lookup_palette_member(
+                &palettes,
+                &CastMemberRef { cast_lib: 99, cast_member: 99 }
+            )
+            .1,
+            PaletteMemberSource::Missing
+        );
+    }
+
+    /// Direct-color (16/32-bit) members carry `palette: null`: they have no
+    /// CLUT, so the collector must skip them instead of registering a phantom
+    /// entry under their inert `paletteRef`. Dedupe must also be exact-once,
+    /// and the manifest must come out key-sorted regardless of insert order.
+    #[test]
+    fn collector_skips_direct_color_and_emits_sorted_manifest() {
+        let mut sink: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+        collect_palette_table(
+            &mut sink,
+            &serde_json::json!({ "palette_ref": "BuiltIn(SystemWin)", "palette": null }),
+        );
+        collect_palette_table(&mut sink, &serde_json::json!({ "png_base64": "" }));
+        assert!(sink.is_empty(), "direct-color members must not register a CLUT");
+
+        for key in ["Member(x)", "BuiltIn(SystemWin)", "Default"] {
+            collect_palette_table(
+                &mut sink,
+                &serde_json::json!({
+                    "palette": { "key": key, "kind": "builtIn", "entries": ["ffffff"] }
+                }),
+            );
+        }
+        // Re-seeing a key must not duplicate or mutate the stored table.
+        collect_palette_table(
+            &mut sink,
+            &serde_json::json!({
+                "palette": { "key": "Default", "kind": "builtIn", "entries": ["000000"] }
+            }),
+        );
+        assert_eq!(sink.len(), 3);
+        assert_eq!(sink["Default"]["entries"][0], "ffffff");
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&palettes_manifest_json("dump_test", &sink))
+                .expect("manifest is valid JSON");
+        assert_eq!(manifest["version"], 1);
+        assert_eq!(manifest["dumper"], "dump_test");
+        assert_eq!(manifest["paletteCount"], 3);
+        let keys: Vec<&String> = manifest["palettes"]
+            .as_object()
+            .expect("palettes object")
+            .keys()
+            .collect();
+        assert_eq!(keys, vec!["BuiltIn(SystemWin)", "Default", "Member(x)"]);
     }
 }

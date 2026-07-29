@@ -32,13 +32,16 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::mcp_get_cast_member_picture;
+use vm_rust::player::mcp::{
+    collect_palette_table, mcp_get_cast_member_picture, palettes_manifest_json,
+};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -78,6 +81,9 @@ async fn dump_inner() {
     let mut player = TestPlayer::new();
     let mut summary: Vec<String> = Vec::new();
     let mut members_meta: Vec<serde_json::Value> = Vec::new();
+    // Deduplicated CLUTs, keyed by the same `paletteRef` string the member
+    // entries carry. Written once as `_palettes.json`.
+    let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
     // Group targets by cct — one load per file.
     use std::collections::BTreeMap;
@@ -196,6 +202,7 @@ async fn dump_inner() {
             let out_path = format!("{}/{}.png", ui_output_dir(), file_stem);
             fs::write(&out_path, &bytes).expect("write engine ui png");
 
+            collect_palette_table(&mut palette_tables, &parsed);
             members_meta.push(serde_json::json!({
                 "name": member_name,
                 "filename": format!("{}.png", file_stem),
@@ -208,6 +215,7 @@ async fn dump_inner() {
                 "originalBitDepth": parsed.get("original_bit_depth"),
                 "useAlpha": parsed.get("use_alpha"),
                 "paletteRef": parsed.get("palette_ref"),
+                "paletteIndexed": parsed.get("palette_indexed"),
                 "width": parsed.get("width"),
                 "height": parsed.get("height"),
             }));
@@ -263,6 +271,18 @@ async fn dump_inner() {
             "    _engine_members.json: {} entries → {}",
             members_meta.len(),
             meta_path
+        ));
+
+        let palettes_path = format!("{}/_palettes.json", ui_output_dir());
+        fs::write(
+            &palettes_path,
+            palettes_manifest_json("dump_engine_bitmaps", &palette_tables),
+        )
+        .expect("write _palettes.json");
+        summary.push(format!(
+            "    _palettes.json: {} distinct CLUTs → {}",
+            palette_tables.len(),
+            palettes_path
         ));
     }
 

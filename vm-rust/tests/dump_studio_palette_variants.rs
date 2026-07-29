@@ -55,13 +55,16 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::mcp_get_cast_member_picture_with_palette;
+use vm_rust::player::mcp::{
+    collect_palette_table, mcp_get_cast_member_picture_with_palette, palettes_manifest_json,
+};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -184,6 +187,10 @@ async fn dump_inner() {
     });
 
     let mut summary: Vec<String> = Vec::new();
+    // Deduplicated CLUTs for the overridden palettes each variant was rendered
+    // through — this dumper's whole point is the substituted palette, so the
+    // exported tables are the effective ones, not the members' declared refs.
+    let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut manifest: Vec<(String, String, String)> = Vec::new();
     let mut total_writes: usize = 0;
     let mut total_misses: Vec<String> = Vec::new();
@@ -259,6 +266,9 @@ async fn dump_inner() {
                     player, bitmap_cl, bitmap_cm, *pal_cl, *pal_cm,
                 )
             });
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                collect_palette_table(&mut palette_tables, &v);
+            }
             let Some((bytes, _w, _h)) = decode_png(&json) else {
                 let first_line = json.lines().next().unwrap_or("(empty)");
                 total_misses.push(format!(
@@ -302,6 +312,18 @@ async fn dump_inner() {
         "    manifest: {} entries → {}",
         manifest.len(),
         manifest_path
+    ));
+
+    let palettes_path = format!("{}/_palettes.json", variants_output_dir());
+    fs::write(
+        &palettes_path,
+        palettes_manifest_json("dump_studio_palette_variants", &palette_tables),
+    )
+    .expect("write _palettes.json");
+    summary.push(format!(
+        "    palettes: {} distinct CLUTs → {}",
+        palette_tables.len(),
+        palettes_path
     ));
 
     println!();

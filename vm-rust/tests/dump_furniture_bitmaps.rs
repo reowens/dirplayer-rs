@@ -28,13 +28,16 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
 use fxhash::FxHashMap;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
-use vm_rust::player::mcp::mcp_get_cast_member_picture;
+use vm_rust::player::mcp::{
+    collect_palette_table, mcp_get_cast_member_picture, palettes_manifest_json,
+};
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
 use vm_rust::player::{reserve_player_mut, reserve_player_ref};
@@ -106,14 +109,23 @@ async fn dump_inner() {
     let mut all_named: Vec<(i32, i32, String)> = Vec::new();
     let mut total_bitmaps = 0usize;
     let mut unnamed_bitmaps = 0usize;
+    // Members declared 0x0 are Director placeholders with no raster. PNG
+    // encoding rejects a zero-width image, so they are counted and skipped
+    // rather than pushed through the picture path (same guard as
+    // `dump_avatar_bitmaps` / `dump_cct_bitmaps`).
+    let mut empty_bitmaps: Vec<String> = Vec::new();
 
     reserve_player_ref(|player| {
         for cast in player.movie.cast_manager.casts.iter() {
             for (member_num, member) in cast.members.iter() {
-                if matches!(member.member_type, CastMemberType::Bitmap(_)) {
+                if let CastMemberType::Bitmap(bitmap_member) = &member.member_type {
                     total_bitmaps += 1;
                     if member.name.is_empty() {
                         unnamed_bitmaps += 1;
+                        continue;
+                    }
+                    if bitmap_member.info.width == 0 || bitmap_member.info.height == 0 {
+                        empty_bitmaps.push(member.name.clone());
                         continue;
                     }
                     all_named.push((cast.number as i32, *member_num as i32, member.name.clone()));
@@ -121,6 +133,7 @@ async fn dump_inner() {
             }
         }
     });
+    empty_bitmaps.sort();
     all_named.sort_by_key(|(cl, cm, _)| (*cl, *cm));
 
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -138,16 +151,23 @@ async fn dump_inner() {
     targets.sort_by(|a, b| a.2.cmp(&b.2));
 
     summary.push(format!(
-        "  loaded {} → {} bitmap members ({} named, {} unnamed, {} duplicate names skipped)",
+        "  loaded {} → {} bitmap members ({} named, {} unnamed, {} duplicate names skipped, {} declared 0x0 skipped)",
         CCT_NAME,
         total_bitmaps,
         targets.len(),
         unnamed_bitmaps,
         duplicate_bitmaps,
+        empty_bitmaps.len(),
     ));
+    if !empty_bitmaps.is_empty() {
+        summary.push(format!("    declared 0x0: {}", empty_bitmaps.join(", ")));
+    }
 
     let mut decode_failures = 0usize;
     let mut pngs_written = 0usize;
+    // Deduplicated CLUTs, keyed by the same `paletteRef` string the member
+    // entries below carry. Written once as `_palettes.json`.
+    let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for (cl, cm, name) in &targets {
         let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
         let parsed: serde_json::Value = match serde_json::from_str(&json) {
@@ -165,6 +185,7 @@ async fn dump_inner() {
             pngs_written += 1;
         }
 
+        collect_palette_table(&mut palette_tables, &parsed);
         members_meta.push(serde_json::json!({
             "name": name,
             "filename": filename,
@@ -177,6 +198,7 @@ async fn dump_inner() {
             "originalBitDepth": parsed.get("original_bit_depth"),
             "useAlpha": parsed.get("use_alpha"),
             "paletteRef": parsed.get("palette_ref"),
+            "paletteIndexed": parsed.get("palette_indexed"),
             "width": parsed.get("width"),
             "height": parsed.get("height"),
         }));
@@ -195,6 +217,18 @@ async fn dump_inner() {
         serde_json::to_string_pretty(&members_meta).expect("serialize _cc_furniture_members.json");
     fs::write(&meta_path, meta_json).expect("write _cc_furniture_members.json");
     summary.push(format!("    sidecar → {}", meta_path));
+
+    let palettes_path = format!("{}/_palettes.json", furniture_output_dir());
+    fs::write(
+        &palettes_path,
+        palettes_manifest_json("dump_furniture_bitmaps", &palette_tables),
+    )
+    .expect("write _palettes.json");
+    summary.push(format!(
+        "    palettes → {} ({} distinct CLUTs)",
+        palettes_path,
+        palette_tables.len()
+    ));
 
     println!();
     println!("=== Furniture cct extraction summary ===");

@@ -9,7 +9,8 @@ use std::convert::TryInto;
 use crate::{
     director::enums::BitmapInfo,
     player::{
-        cast_lib::CastMemberRef, handlers::datum_handlers::cast_member_ref::CastMemberRefHandlers,
+        cast_lib::CastMemberRef, cast_member::PaletteMember,
+        handlers::datum_handlers::cast_member_ref::CastMemberRefHandlers,
         sprite::ColorRef,
     },
 };
@@ -946,6 +947,64 @@ fn color_fallback(color_index: u8, original_bit_depth: u8) -> (u8, u8, u8) {
         .unwrap_or((0, 0, 0))
 }
 
+/// How a `PaletteRef::Member` reference resolved against the movie's palette map.
+///
+/// Exported alongside the CLUT so a consumer can tell a genuine member palette
+/// apart from one that silently fell back — the two produce very different
+/// tables but are indistinguishable from the `paletteRef` string alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteMemberSource {
+    /// The referenced palette member was found (by slot, or by member number
+    /// when `cast_lib` is 0 / the slot lookup missed).
+    Exact,
+    /// The exact member was missing (stale clutId from old numbering); a
+    /// sibling palette in the same cast library was substituted.
+    CastLibFallback,
+    /// No palette member matched at all — colors come from the system default.
+    Missing,
+}
+
+impl PaletteMemberSource {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            PaletteMemberSource::Exact => "exact",
+            PaletteMemberSource::CastLibFallback => "castLibFallback",
+            PaletteMemberSource::Missing => "missing",
+        }
+    }
+}
+
+/// Locate the palette member a `PaletteRef::Member` resolves against, together
+/// with how it was found.
+///
+/// Shared by per-pixel color resolution (`resolve_color_ref`) and CLUT export
+/// so an exported table can never disagree with the pixels that were rendered.
+#[inline]
+pub fn lookup_palette_member<'a>(
+    palettes: &'a PaletteMap,
+    member_ref: &CastMemberRef,
+) -> (Option<&'a PaletteMember>, PaletteMemberSource) {
+    // cast_lib 0 = search all cast libs by member number
+    let exact = if member_ref.cast_lib == 0 {
+        palettes.find_by_member(member_ref.cast_member as u32)
+    } else {
+        let slot_number = CastMemberRefHandlers::get_cast_slot_number(
+            member_ref.cast_lib as u32,
+            member_ref.cast_member as u32,
+        );
+        palettes
+            .get(slot_number as usize)
+            .or_else(|| palettes.find_by_member(member_ref.cast_member as u32))
+    };
+    if let Some(member) = exact {
+        return (Some(member), PaletteMemberSource::Exact);
+    }
+    if let Some(member) = palettes.find_by_cast_lib(member_ref.cast_lib as u32) {
+        return (Some(member), PaletteMemberSource::CastLibFallback);
+    }
+    (None, PaletteMemberSource::Missing)
+}
+
 #[inline]
 pub fn resolve_color_ref(
     palettes: &PaletteMap,
@@ -963,28 +1022,18 @@ pub fn resolve_color_ref(
                         .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
                 }
                 PaletteRef::Member(member_ref) => {
-                    // cast_lib 0 = search all cast libs by member number
-                    let palette_member = if member_ref.cast_lib == 0 {
-                        palettes.find_by_member(member_ref.cast_member as u32)
-                    } else {
-                        let slot_number = CastMemberRefHandlers::get_cast_slot_number(
-                            member_ref.cast_lib as u32,
-                            member_ref.cast_member as u32,
-                        );
-                        palettes.get(slot_number as usize)
-                            .or_else(|| palettes.find_by_member(member_ref.cast_member as u32))
-                    };
-                    if let Some(member) = palette_member {
-                        member.colors.get(idx as usize).copied()
-                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
-                    } else if let Some(member) = palettes.find_by_cast_lib(member_ref.cast_lib as u32) {
-                        // Fallback: exact palette member not found (stale clutId from old numbering),
-                        // use any palette in the same cast library
-                        member.colors.get(idx as usize).copied()
-                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
-                    } else {
-                        lookup_builtin_palette(&get_system_default_palette(), idx, original_bit_depth)
-                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth))
+                    match lookup_palette_member(palettes, member_ref).0 {
+                        Some(member) => member
+                            .colors
+                            .get(idx as usize)
+                            .copied()
+                            .unwrap_or_else(|| color_fallback(idx, original_bit_depth)),
+                        None => lookup_builtin_palette(
+                            &get_system_default_palette(),
+                            idx,
+                            original_bit_depth,
+                        )
+                        .unwrap_or_else(|| color_fallback(idx, original_bit_depth)),
                     }
                 }
                 PaletteRef::Default => {

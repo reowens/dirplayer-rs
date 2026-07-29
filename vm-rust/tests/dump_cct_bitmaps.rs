@@ -16,7 +16,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -25,8 +25,8 @@ use vm_rust::player::bitmap::bitmap::PaletteRef;
 use vm_rust::player::cast_lib::{CastLib, CastLibState};
 use vm_rust::player::cast_member::CastMemberType;
 use vm_rust::player::mcp::{
-    mcp_get_cast_member_picture, mcp_get_cast_member_picture_with_palette,
-    mcp_get_film_loop_frames,
+    collect_palette_table, mcp_get_cast_member_picture, mcp_get_cast_member_picture_with_palette,
+    mcp_get_film_loop_frames, palettes_manifest_json,
 };
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
@@ -113,7 +113,13 @@ async fn dump_inner() {
     let mut missing_source_ccts: Vec<serde_json::Value> = Vec::new();
     let mut unnamed_film_loops: Vec<serde_json::Value> = Vec::new();
     let mut film_loop_export_errors: Vec<serde_json::Value> = Vec::new();
+    let mut empty_bitmap_members: Vec<serde_json::Value> = Vec::new();
     let mut selected_rooms: Vec<serde_json::Value> = Vec::new();
+    // Deduplicated CLUTs across every room in this run, keyed by the same
+    // `paletteRef` string the per-room `_members.json` entries carry. Written
+    // once at the rooms root as `_palettes.json`. Palette-cycle frames
+    // contribute their overridden (effective) CLUT here too.
+    let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
     // Read each room's canonical.roomBitmaps so we know which FG members
     // (door masks, bears, bardesks, etc.) to dump per room.
@@ -183,6 +189,12 @@ async fn dump_inner() {
 
         // Snapshot bitmap targets.
         let mut targets: Vec<(i32, i32, String)> = Vec::new();
+        // Declared (info) dimensions per bitmap member. Members declared 0x0
+        // are Director placeholders with no raster at all; PNG encoding
+        // rejects a zero-width image, so they are recorded as skips instead
+        // of being pushed through the picture path. Mirrors the guard
+        // `dump_avatar_bitmaps` already applies.
+        let mut declared_dims: HashMap<(i32, i32), (u16, u16)> = HashMap::new();
         let mut film_loop_targets: Vec<(i32, i32, String)> = Vec::new();
         let mut bg_target: Option<(i32, i32, String)> = None;
         // Fall back to "<base>_bg" if no override was provided.
@@ -197,7 +209,11 @@ async fn dump_inner() {
                     let cl = cast.number as i32;
                     let cm = *member_num as i32;
                     match &member.member_type {
-                        CastMemberType::Bitmap(_) => {
+                        CastMemberType::Bitmap(bitmap_member) => {
+                            declared_dims.insert(
+                                (cl, cm),
+                                (bitmap_member.info.width, bitmap_member.info.height),
+                            );
                             let name = if member.name.is_empty() {
                                 format!("member_{}", member_num)
                             } else {
@@ -291,6 +307,20 @@ async fn dump_inner() {
         // child, so the right variant is rendered.
         let mut taken_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (cl, cm, name) in &targets {
+            if let Some((0, _)) | Some((_, 0)) = declared_dims.get(&(*cl, *cm)).copied() {
+                let (w, h) = declared_dims[&(*cl, *cm)];
+                empty_bitmap_members.push(serde_json::json!({
+                    "sourceCct": format!("{}.cct", cct_base),
+                    "roomId": room_id,
+                    "castLib": cl,
+                    "castMember": cm,
+                    "name": name,
+                    "declaredWidth": w,
+                    "declaredHeight": h,
+                    "reason": "emptyDeclaredBitmap",
+                }));
+                continue;
+            }
             let json = reserve_player_ref(|player| mcp_get_cast_member_picture(player, *cl, *cm));
             // Determine emit name + filename. First occurrence keeps the
             // bare name (matches Director's first-match name-lookup
@@ -554,6 +584,9 @@ async fn dump_inner() {
                                 player, *cl, *cm, *pal_cl, *pal_cm,
                             )
                         });
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&frame_json) {
+                            collect_palette_table(&mut palette_tables, &v);
+                        }
                         if let Some((bytes, _, _)) = decode_png(&frame_json) {
                             let fname = format!("{}__pal_{}.png", file_stem, frame_n);
                             let path = format!("{}/{}", fg_dest_dir, fname);
@@ -612,6 +645,9 @@ async fn dump_inner() {
                                     player, *cl, *cm, *pal_cl, *pal_cm,
                                 )
                             });
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&frame_json) {
+                                collect_palette_table(&mut palette_tables, &v);
+                            }
                             if let Some((bytes, _, _)) = decode_png(&frame_json) {
                                 let fname = format!(
                                     "{}__{}__pal_{}.png",
@@ -647,6 +683,7 @@ async fn dump_inner() {
             // Capture metadata regardless of PNG decode success — name lookup
             // and bitmap shape are useful even for empty/zero-byte members.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                collect_palette_table(&mut palette_tables, &v);
                 if !emit_name.is_empty() {
                     let mut entry = serde_json::json!({
                         "name": name,
@@ -660,6 +697,7 @@ async fn dump_inner() {
                         "originalBitDepth": v.get("original_bit_depth"),
                         "useAlpha": v.get("use_alpha"),
                         "paletteRef": v.get("palette_ref"),
+                        "paletteIndexed": v.get("palette_indexed"),
                         "width": v.get("width"),
                         "height": v.get("height"),
                     });
@@ -762,10 +800,12 @@ async fn dump_inner() {
 
     unnamed_film_loops.sort_by(compare_skip_entries);
     film_loop_export_errors.sort_by(compare_skip_entries);
+    empty_bitmap_members.sort_by(compare_skip_entries);
 
     let skipped_count = missing_source_ccts.len()
         + unnamed_film_loops.len()
-        + film_loop_export_errors.len();
+        + film_loop_export_errors.len()
+        + empty_bitmap_members.len();
     let (scope_kind, skip_summary_name) = if room_filter.is_some() {
         ("filtered", "_skip_summary.filtered.json")
     } else {
@@ -784,6 +824,7 @@ async fn dump_inner() {
         "missingSourceCcts": missing_source_ccts,
         "unnamedFilmLoops": unnamed_film_loops,
         "filmLoopExportErrors": film_loop_export_errors,
+        "emptyBitmapMembers": empty_bitmap_members,
     });
     fs::write(
         &skip_summary_path,
@@ -793,6 +834,20 @@ async fn dump_inner() {
     summary.push(format!(
         "  skip summary: {} entries → {}",
         skipped_count, skip_summary_path
+    ));
+
+    // Resolved CLUT contents, deduplicated across the whole run. `paletteRef`
+    // on any `_members.json` entry is the join key.
+    let palettes_path = format!("{}/_palettes.json", rooms_output_dir());
+    fs::write(
+        &palettes_path,
+        palettes_manifest_json("dump_cct_bitmaps", &palette_tables),
+    )
+    .expect("write cct palettes manifest");
+    summary.push(format!(
+        "  palettes: {} distinct CLUTs → {}",
+        palette_tables.len(),
+        palettes_path
     ));
 
     println!();
