@@ -149,6 +149,12 @@ fn studio_mapping() -> Vec<(&'static str, &'static str)> {
         ("studio_model_g", "studio_g"),
         ("personal_suite_model", "personal_suite"),
         ("star_suite_model", "star_suite"),
+        // Wayne Entertainment. Upstream ships four of these layouts (`Lab_1`..
+        // `Lab_4`, backgrounds `wayne_ent_1`..`4`) but registers none of them in
+        // `StudioMap.aLayouts`, so they have no upstream layout index. Furni
+        // ports `Lab_4`; the other three are the same geometry with a different
+        // background and only need a row here to follow.
+        ("wayne_ent_4", "wayne"),
     ]
 }
 
@@ -199,6 +205,7 @@ fn read_canonical_studio_members() -> std::collections::HashMap<String, Vec<Stri
             "studio_g" => "studio_model_g",
             "star_suite" => "studio_star_suite",
             "personal_suite" => "studio_personal_suite",
+            "wayne" => "studio_wayne",
             _ => continue,
         };
         let names: Vec<String> = members.keys().cloned().collect();
@@ -386,11 +393,11 @@ async fn dump_inner() {
     let canonical_members_by_studio = read_canonical_studio_members();
     if !canonical_members_by_studio.is_empty() {
         // Loud failure if a studio JSON is missing or misnamed in the
-        // stem→registry map. studio_mapping() has 9 entries; if we read
-        // ROOM_JSON_DIR successfully we expect 9 studios.
+        // stem→registry map. Keep this in step with studio_mapping().
         assert!(
-            canonical_members_by_studio.len() == 9,
-            "expected 9 studio JSONs in ROOM_JSON_DIR, got {} — check stem→registry map in read_canonical_studio_members()",
+            canonical_members_by_studio.len() == studio_mapping().len(),
+            "expected {} studio JSONs in ROOM_JSON_DIR, got {} — check stem→registry map in read_canonical_studio_members()",
+            studio_mapping().len(),
             canonical_members_by_studio.len()
         );
     }
