@@ -30,7 +30,7 @@
 //!   wayne_ent_1            (member 153) → wayne_1
 //!   wayne_ent_2            (member 167) → wayne_2
 //!   wayne_ent_3            (member 173) → wayne_3
-//!   wayne_ent_4            (member 178) → wayne
+//!   wayne_ent_4            (member 178) → wayne_4
 //!
 //! Note: studio_e/f/g currently have no Furni room JSON (per
 //! `docs/casts/EXTRACTION-PLAN.md` task #5 — "Translate the 7 base
@@ -161,13 +161,15 @@ fn studio_mapping() -> Vec<(&'static str, &'static str)> {
         // so the per-room member dump below writes a different member list per
         // room dir — not just a different background.
         //
-        // Room-id suffixes are offset by one against the Lab number: `wayne` IS
-        // `Lab_4` and predates the numbering. Kept as-is because the id is
-        // persisted on studio rows Furni-side.
-        ("wayne_ent_4", "wayne"),
+        // Room ids track the Lab number exactly: `wayne_ent_N` → `wayne_N` →
+        // Furni `studio_wayne_N`. `Lab_4` was ported first as an unsuffixed
+        // `wayne`/`studio_wayne`, which left the ids offset by one against the
+        // Labs; Furni renamed it (with a `room_def_id` data migration) rather
+        // than keep the offset.
         ("wayne_ent_1", "wayne_1"),
         ("wayne_ent_2", "wayne_2"),
         ("wayne_ent_3", "wayne_3"),
+        ("wayne_ent_4", "wayne_4"),
     ]
 }
 
@@ -218,10 +220,10 @@ fn read_canonical_studio_members() -> std::collections::HashMap<String, Vec<Stri
             "studio_g" => "studio_model_g",
             "star_suite" => "studio_star_suite",
             "personal_suite" => "studio_personal_suite",
-            "wayne" => "studio_wayne",
             "wayne_1" => "studio_wayne_1",
             "wayne_2" => "studio_wayne_2",
             "wayne_3" => "studio_wayne_3",
+            "wayne_4" => "studio_wayne_4",
             _ => continue,
         };
         let names: Vec<String> = members.keys().cloned().collect();
