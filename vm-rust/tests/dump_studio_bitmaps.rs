@@ -4,8 +4,8 @@
 //!
 //! Sibling of `dump_cct_bitmaps.rs.example`. Same toolchain (dirplayer-rs
 //! TestPlayer + `mcp_get_cast_member_picture`), but pointed at one
-//! cast-library cct (`cc_studio.cct`) that holds all 9 studio variants
-//! as named bitmap members — instead of looping per-room cct files.
+//! cast-library cct (`cc_studio.cct`) that holds every studio variant
+//! as a named bitmap member — instead of looping per-room cct files.
 //!
 //! Why this exists: studio rooms (Star Suite, Personal Suite,
 //! studio_a..g) are NOT publicrooms. They live as cast members inside
@@ -27,6 +27,10 @@
 //!   studio_model_e         (member 226) → studio_e
 //!   studio_model_f         (member 228) → studio_f
 //!   studio_model_g         (member 229) → studio_g
+//!   wayne_ent_1            (member 153) → wayne_1
+//!   wayne_ent_2            (member 167) → wayne_2
+//!   wayne_ent_3            (member 173) → wayne_3
+//!   wayne_ent_4            (member 178) → wayne
 //!
 //! Note: studio_e/f/g currently have no Furni room JSON (per
 //! `docs/casts/EXTRACTION-PLAN.md` task #5 — "Translate the 7 base
@@ -151,10 +155,19 @@ fn studio_mapping() -> Vec<(&'static str, &'static str)> {
         ("star_suite_model", "star_suite"),
         // Wayne Entertainment. Upstream ships four of these layouts (`Lab_1`..
         // `Lab_4`, backgrounds `wayne_ent_1`..`4`) but registers none of them in
-        // `StudioMap.aLayouts`, so they have no upstream layout index. Furni
-        // ports `Lab_4`; the other three are the same geometry with a different
-        // background and only need a row here to follow.
+        // `StudioMap.aLayouts`, so they have no upstream layout index. Furni now
+        // ports all four. They share a byte-identical MapXml (one walkable
+        // geometry) but each SceneXml carries its own `<StaticItems>` prop set,
+        // so the per-room member dump below writes a different member list per
+        // room dir — not just a different background.
+        //
+        // Room-id suffixes are offset by one against the Lab number: `wayne` IS
+        // `Lab_4` and predates the numbering. Kept as-is because the id is
+        // persisted on studio rows Furni-side.
         ("wayne_ent_4", "wayne"),
+        ("wayne_ent_1", "wayne_1"),
+        ("wayne_ent_2", "wayne_2"),
+        ("wayne_ent_3", "wayne_3"),
     ]
 }
 
@@ -206,6 +219,9 @@ fn read_canonical_studio_members() -> std::collections::HashMap<String, Vec<Stri
             "star_suite" => "studio_star_suite",
             "personal_suite" => "studio_personal_suite",
             "wayne" => "studio_wayne",
+            "wayne_1" => "studio_wayne_1",
+            "wayne_2" => "studio_wayne_2",
+            "wayne_3" => "studio_wayne_3",
             _ => continue,
         };
         let names: Vec<String> = members.keys().cloned().collect();
