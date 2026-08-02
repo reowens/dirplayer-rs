@@ -20,7 +20,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -48,6 +48,7 @@ fn recycler_output_dir() -> String {
 }
 
 const SCRATCH_DUMP_ROOT: &str = "/tmp/dirplayer_dumps/recycler";
+const DCR_SOURCE: &str = "games/FurniFactory/FurniFactory2.dcr";
 
 #[test]
 fn dump_recycler_dcr_score() {
@@ -231,7 +232,7 @@ async fn dump_inner() {
     // is the direct input for static-fixture placement in the render
     // port — most stage objects appear once per cast member at one stage
     // location across many frames.
-    let mut seen: HashMap<(String, i16, i16), serde_json::Value> = HashMap::new();
+    let mut seen: BTreeMap<(String, i16, i16), serde_json::Value> = BTreeMap::new();
     for rec in &sprite_records {
         let name = rec
             .get("memberName")
@@ -245,15 +246,10 @@ async fn dump_inner() {
         let py = rec.get("posY").and_then(|v| v.as_i64()).unwrap_or(0) as i16;
         seen.entry((name, px, py)).or_insert_with(|| rec.clone());
     }
-    let mut fixtures: Vec<serde_json::Value> = seen.into_values().collect();
-    fixtures.sort_by(|a, b| {
-        let an = a.get("memberName").and_then(|v| v.as_str()).unwrap_or("");
-        let bn = b.get("memberName").and_then(|v| v.as_str()).unwrap_or("");
-        an.cmp(bn)
-    });
+    let fixtures: Vec<serde_json::Value> = seen.into_values().collect();
 
     let payload = serde_json::json!({
-        "source": dcr,
+        "source": DCR_SOURCE,
         "frameCountUpper": frame_count,
         "frameChannelRecordCount": channel_count,
         "spriteDetailCount": detail_count,
