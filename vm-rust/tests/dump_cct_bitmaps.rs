@@ -16,7 +16,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -97,12 +97,14 @@ struct ExtraPalettes {
     extras: Vec<(String, i32, Vec<(i32, i32, i32)>)>,
 }
 
-/// Keep one deterministic cast member for each logical palette frame. Some
-/// source casts contain duplicate suffixes (Neptune has two distinct
-/// `action_20` members), while the sidecar schema is keyed by frame number.
-fn normalize_palette_siblings(siblings: &mut Vec<(i32, i32, i32)>) {
+/// Sort duplicate logical frames by cast identity so the first member wins the
+/// frame-map/PNG slot while every physical member can still enter the CLUT ledger.
+fn sort_palette_siblings(siblings: &mut Vec<(i32, i32, i32)>) {
     siblings.sort_by_key(|(frame, cast_lib, cast_member)| (*frame, *cast_lib, *cast_member));
-    siblings.dedup_by_key(|(frame, _, _)| *frame);
+}
+
+fn logical_palette_frame_count(siblings: &[(i32, i32, i32)]) -> usize {
+    siblings.iter().map(|(frame, _, _)| *frame).collect::<BTreeSet<_>>().len()
 }
 
 #[test]
@@ -425,9 +427,10 @@ async fn dump_inner() {
                         out
                     };
                     let mut siblings = collect(&group);
+                    sort_palette_siblings(&mut siblings);
                     let mut chosen_group = group.clone();
                     let mut chosen_default_frame = default_frame;
-                    if siblings.len() < 3 {
+                    if logical_palette_frame_count(&siblings) < 3 {
                         // Cousin-group fallback for room-specific PaletteAnimator
                         // subclasses that store the bitmap's idle palette in a
                         // single-frame group (e.g. `neptune_discofloor_peaceful_0`)
@@ -461,18 +464,18 @@ async fn dump_inner() {
                             }
                             if let Some((best_g, best_sibs)) = cousin_groups
                                 .into_iter()
-                                .filter(|(g, sibs)| g != &group && sibs.len() >= 3)
-                                .max_by_key(|(_, sibs)| sibs.len())
+                                .filter(|(g, sibs)| g != &group && logical_palette_frame_count(sibs) >= 3)
+                                .max_by_key(|(_, sibs)| logical_palette_frame_count(sibs))
                             {
                                 chosen_group = best_g;
                                 siblings = best_sibs;
-                                normalize_palette_siblings(&mut siblings);
+                                sort_palette_siblings(&mut siblings);
                                 chosen_default_frame = siblings[0].0;
                             }
                         }
                     }
-                    normalize_palette_siblings(&mut siblings);
-                    if siblings.len() < 3 { return None; }
+                    sort_palette_siblings(&mut siblings);
+                    if logical_palette_frame_count(&siblings) < 3 { return None; }
                     // Trim trailing `_` for cleaner group label (e.g.
                     // "londonlights_" → "londonlights"; "GoalightPalette"
                     // unchanged).
@@ -531,8 +534,8 @@ async fn dump_inner() {
                         out
                     };
                     let mut default_siblings = collect(&default_group);
-                    normalize_palette_siblings(&mut default_siblings);
-                    let uses_cousin_primary = default_siblings.len() < 3;
+                    sort_palette_siblings(&mut default_siblings);
+                    let uses_cousin_primary = logical_palette_frame_count(&default_siblings) < 3;
                     // Walk back one `_` segment to the shared parent prefix, then
                     // group every palette member under it by cousin family —
                     // exactly like the primary pass's cousin-group fallback.
@@ -556,15 +559,19 @@ async fn dump_inner() {
                         }
                     }
                     for siblings in cousin_groups.values_mut() {
-                        normalize_palette_siblings(siblings);
+                        sort_palette_siblings(siblings);
                     }
 
                     let primary_group = if uses_cousin_primary {
                         cousin_groups
                             .iter()
-                            .filter(|(group, siblings)| *group != &default_group && siblings.len() >= 3)
+                            .filter(|(group, siblings)| {
+                                *group != &default_group && logical_palette_frame_count(siblings) >= 3
+                            })
                             .max_by(|(group_a, siblings_a), (group_b, siblings_b)| {
-                                siblings_a.len().cmp(&siblings_b.len()).then_with(|| group_b.cmp(group_a))
+                                logical_palette_frame_count(siblings_a)
+                                    .cmp(&logical_palette_frame_count(siblings_b))
+                                    .then_with(|| group_b.cmp(group_a))
                             })
                             .map(|(group, _)| group.clone())?
                     } else {
@@ -576,7 +583,9 @@ async fn dump_inner() {
                     let mut extras: Vec<(String, i32, Vec<(i32, i32, i32)>)> = Vec::new();
                     for (cg, sibs) in cousin_groups {
                         if cg == primary_group { continue; }
-                        if sibs.len() < 3 && !(uses_cousin_primary && cg == default_group && !sibs.is_empty()) {
+                        if logical_palette_frame_count(&sibs) < 3
+                            && !(uses_cousin_primary && cg == default_group && !sibs.is_empty())
+                        {
                             continue;
                         }
                         let short_label = cg
@@ -612,19 +621,19 @@ async fn dump_inner() {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&frame_json) {
                             collect_palette_table(&mut palette_tables, &v);
                         }
-                        if let Some((bytes, _, _)) = decode_png(&frame_json) {
+                        let frame_key = frame_n.to_string();
+                        if !frames_map.contains_key(&frame_key)
+                            && let Some((bytes, _, _)) = decode_png(&frame_json)
+                        {
                             let fname = format!("{}__pal_{}.png", file_stem, frame_n);
                             let path = format!("{}/{}", fg_dest_dir, fname);
                             fs::write(path, &bytes).ok();
-                            frames_map.insert(
-                                frame_n.to_string(),
-                                serde_json::Value::String(fname),
-                            );
+                            frames_map.insert(frame_key, serde_json::Value::String(fname));
                         }
                     }
                     summary.push(format!(
                         "    palette-cycle: {} → {} frames (group={}, start={})",
-                        emit_name, siblings.len(), group, _default_frame
+                        emit_name, logical_palette_frame_count(siblings), group, _default_frame
                     ));
                     serde_json::Value::Object(frames_map)
                 });
@@ -673,17 +682,17 @@ async fn dump_inner() {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&frame_json) {
                                 collect_palette_table(&mut palette_tables, &v);
                             }
-                            if let Some((bytes, _, _)) = decode_png(&frame_json) {
+                            let frame_key = frame_n.to_string();
+                            if !frames_map.contains_key(&frame_key)
+                                && let Some((bytes, _, _)) = decode_png(&frame_json)
+                            {
                                 let fname = format!(
                                     "{}__{}__pal_{}.png",
                                     file_stem, short_label, frame_n
                                 );
                                 let path = format!("{}/{}", fg_dest_dir, fname);
                                 fs::write(path, &bytes).ok();
-                                frames_map.insert(
-                                    frame_n.to_string(),
-                                    serde_json::Value::String(fname),
-                                );
+                                frames_map.insert(frame_key, serde_json::Value::String(fname));
                             }
                         }
                         family_summary.push(format!("{}({})", short_label, frames_map.len()));
