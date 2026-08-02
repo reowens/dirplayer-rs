@@ -97,6 +97,14 @@ struct ExtraPalettes {
     extras: Vec<(String, i32, Vec<(i32, i32, i32)>)>,
 }
 
+/// Keep one deterministic cast member for each logical palette frame. Some
+/// source casts contain duplicate suffixes (Neptune has two distinct
+/// `action_20` members), while the sidecar schema is keyed by frame number.
+fn normalize_palette_siblings(siblings: &mut Vec<(i32, i32, i32)>) {
+    siblings.sort_by_key(|(frame, cast_lib, cast_member)| (*frame, *cast_lib, *cast_member));
+    siblings.dedup_by_key(|(frame, _, _)| *frame);
+}
+
 #[test]
 fn dump_publicroom_cct_bitmaps() {
     async_std::task::block_on(dump_inner());
@@ -458,13 +466,13 @@ async fn dump_inner() {
                             {
                                 chosen_group = best_g;
                                 siblings = best_sibs;
-                                siblings.sort_by_key(|t| t.0);
+                                normalize_palette_siblings(&mut siblings);
                                 chosen_default_frame = siblings[0].0;
                             }
                         }
                     }
+                    normalize_palette_siblings(&mut siblings);
                     if siblings.len() < 3 { return None; }
-                    siblings.sort_by_key(|t| t.0);
                     // Trim trailing `_` for cleaner group label (e.g.
                     // "londonlights_" → "londonlights"; "GoalightPalette"
                     // unchanged).
@@ -472,18 +480,17 @@ async fn dump_inner() {
                     Some((group_label, chosen_default_frame, siblings))
                 });
 
-            // Additive multi-palette pass (SEPARATE from the primary discovery
-            // above, which stays byte-identical). Some bitmaps carry MULTIPLE
+            // Additive multi-palette pass. Some bitmaps carry MULTIPLE
             // independent palette families sharing one parent prefix — Tokyo's
             // disco floor has `tokyo_discofloor_peaceful_1..16`,
             // `..._action_1..16` and `..._switch_1..16`. The primary pass only
             // emits the bitmap's own default family (peaceful) because it
             // already has ≥3 frames, so the cousin-group fallback never fires.
             // Here we re-derive the sibling families and hand them off for
-            // rendering. Only the DIRECT case (default family ≥3 frames) can
-            // carry extras; the fallback case (default family <3, e.g. Neptune
-            // whose `peaceful` has a single frame) must stay a single group, so
-            // we bail out to keep those rooms unchanged.
+            // rendering. In the direct case the default family remains primary.
+            // In the fallback case (Neptune's one-frame peaceful family), the
+            // same largest cousin selected above remains primary and the
+            // singleton default is emitted as an explicitly named extra.
             let extra_palettes: Option<ExtraPalettes> =
                 reserve_player_ref(|player| {
                     let cast = player.movie.cast_manager.get_cast(*cl as u32).ok()?;
@@ -523,15 +530,16 @@ async fn dump_inner() {
                         }
                         out
                     };
-                    // Fallback case → don't add extras (keep single-group rooms).
-                    if collect(&default_group).len() < 3 { return None; }
+                    let mut default_siblings = collect(&default_group);
+                    normalize_palette_siblings(&mut default_siblings);
+                    let uses_cousin_primary = default_siblings.len() < 3;
                     // Walk back one `_` segment to the shared parent prefix, then
                     // group every palette member under it by cousin family —
                     // exactly like the primary pass's cousin-group fallback.
                     let trimmed = default_group.trim_end_matches('_');
                     let last_us = trimmed.rfind('_')?;
                     let parent_prefix = &trimmed[..=last_us]; // includes trailing `_`
-                    let mut cousin_groups: HashMap<String, Vec<(i32, i32, i32)>> = HashMap::new();
+                    let mut cousin_groups: BTreeMap<String, Vec<(i32, i32, i32)>> = BTreeMap::new();
                     for (sib_num, sib) in pal_cast.members.iter() {
                         if sib.member_type.as_palette().is_none() { continue; }
                         let n = &sib.name;
@@ -547,13 +555,30 @@ async fn dump_inner() {
                             }
                         }
                     }
-                    // Keep cousin families with ≥3 frames, EXCLUDING the default
-                    // family (it's already emitted by the primary pass).
+                    for siblings in cousin_groups.values_mut() {
+                        normalize_palette_siblings(siblings);
+                    }
+
+                    let primary_group = if uses_cousin_primary {
+                        cousin_groups
+                            .iter()
+                            .filter(|(group, siblings)| *group != &default_group && siblings.len() >= 3)
+                            .max_by(|(group_a, siblings_a), (group_b, siblings_b)| {
+                                siblings_a.len().cmp(&siblings_b.len()).then_with(|| group_b.cmp(group_a))
+                            })
+                            .map(|(group, _)| group.clone())?
+                    } else {
+                        default_group.clone()
+                    };
+
+                    // Keep multi-frame cousins plus the singleton default family
+                    // when primary discovery had to fall back to a cousin.
                     let mut extras: Vec<(String, i32, Vec<(i32, i32, i32)>)> = Vec::new();
-                    for (cg, mut sibs) in cousin_groups {
-                        if cg == default_group { continue; }
-                        if sibs.len() < 3 { continue; }
-                        sibs.sort_by_key(|t| t.0);
+                    for (cg, sibs) in cousin_groups {
+                        if cg == primary_group { continue; }
+                        if sibs.len() < 3 && !(uses_cousin_primary && cg == default_group && !sibs.is_empty()) {
+                            continue;
+                        }
                         let short_label = cg
                             .strip_prefix(parent_prefix)
                             .unwrap_or(&cg)
@@ -564,9 +589,9 @@ async fn dump_inner() {
                     }
                     if extras.is_empty() { return None; }
                     extras.sort_by(|a, b| a.0.cmp(&b.0));
-                    let primary_short = default_group
+                    let primary_short = primary_group
                         .strip_prefix(parent_prefix)
-                        .unwrap_or(&default_group)
+                        .unwrap_or(&primary_group)
                         .trim_end_matches('_')
                         .to_string();
                     Some(ExtraPalettes { primary_short, extras })
