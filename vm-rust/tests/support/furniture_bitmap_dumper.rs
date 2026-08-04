@@ -12,7 +12,7 @@ use vm_rust::player::mcp::{
 };
 use vm_rust::player::testing::TestPlayer;
 use vm_rust::player::testing_shared::TestHarness;
-use vm_rust::player::{reserve_player_mut, reserve_player_ref};
+use vm_rust::player::{DirPlayer, reserve_player_mut, reserve_player_ref};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FurnitureBitmapProfile {
@@ -21,6 +21,7 @@ pub(crate) struct FurnitureBitmapProfile {
     pub(crate) members_sidecar: &'static str,
     pub(crate) dumper_name: &'static str,
     pub(crate) external_palette_source_cct: Option<&'static str>,
+    pub(crate) emit_matte_masks: bool,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,7 @@ pub(crate) struct FurnitureBitmapDumpReport {
     pub(crate) folded_name_collisions: Vec<(String, Vec<String>)>,
     pub(crate) decode_failures: Vec<String>,
     pub(crate) external_palette_renders: usize,
+    pub(crate) matte_masks_written: usize,
 }
 
 fn casts_root() -> String {
@@ -49,6 +51,10 @@ fn output_dir(profile: FurnitureBitmapProfile) -> String {
 
 fn png_dir(profile: FurnitureBitmapProfile) -> String {
     format!("{}/data", output_dir(profile))
+}
+
+fn matte_dir(profile: FurnitureBitmapProfile) -> String {
+    format!("{}/matte", output_dir(profile))
 }
 
 fn synthesize_casts_from_loaded_movie() {
@@ -122,11 +128,66 @@ fn external_palette_member(cast_lib: i32, cast_member: i32, palette_cast: i32) -
     })
 }
 
+fn encode_matte_mask(
+    player: &DirPlayer,
+    cast_lib: i32,
+    cast_member: i32,
+) -> Result<Vec<u8>, String> {
+    use image::{ImageFormat, RgbaImage};
+
+    let cast = player
+        .movie
+        .cast_manager
+        .get_cast(cast_lib as u32)
+        .map_err(|_| format!("cast library {} not found", cast_lib))?;
+    let member = cast
+        .members
+        .get(&(cast_member as u32))
+        .ok_or_else(|| format!("cast member {}/{} not found", cast_lib, cast_member))?;
+    let bitmap_member = member
+        .member_type
+        .as_bitmap()
+        .ok_or_else(|| format!("cast member {}/{} is not a bitmap", cast_lib, cast_member))?;
+    let mut bitmap = player
+        .bitmap_manager
+        .get_bitmap(bitmap_member.image_ref)
+        .ok_or_else(|| {
+            format!(
+                "bitmap data for cast member {}/{} not loaded",
+                cast_lib, cast_member
+            )
+        })?
+        .clone();
+    let palettes = player.movie.cast_manager.palettes();
+    bitmap.create_matte(&palettes);
+    let matte = bitmap.matte.as_ref().ok_or_else(|| {
+        format!(
+            "matte creation failed for cast member {}/{}",
+            cast_lib, cast_member
+        )
+    })?;
+    let mut image = RgbaImage::new(bitmap.width as u32, bitmap.height as u32);
+    for y in 0..bitmap.height {
+        for x in 0..bitmap.width {
+            let alpha = if matte.get_bit(x, y) { 255 } else { 0 };
+            image.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, alpha]));
+        }
+    }
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|error| format!("matte PNG encoding failed ({})", error))?;
+    Ok(png)
+}
+
 pub(crate) async fn dump_furniture_profile(
     profile: FurnitureBitmapProfile,
 ) -> FurnitureBitmapDumpReport {
     fs::create_dir_all(output_dir(profile)).expect("create furniture assets dir");
     fs::create_dir_all(png_dir(profile)).expect("create furniture data dir");
+    if profile.emit_matte_masks {
+        fs::create_dir_all(matte_dir(profile)).expect("create furniture matte dir");
+    }
 
     let cct_path = format!("{}/{}", casts_root(), profile.source_cct);
     if !PathBuf::from(&cct_path).exists() {
@@ -288,6 +349,7 @@ pub(crate) async fn dump_furniture_profile(
     let mut emitted_names: Vec<String> = Vec::new();
     let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut external_palette_renders = 0usize;
+    let mut matte_masks_written = 0usize;
 
     for (cast_lib, cast_member, name) in &targets {
         let external_palette = external_palette_cast.and_then(|palette_cast| {
@@ -331,6 +393,22 @@ pub(crate) async fn dump_furniture_profile(
         pngs_written += 1;
         emitted_names.push(name.clone());
 
+        if profile.emit_matte_masks {
+            let matte =
+                reserve_player_ref(|player| encode_matte_mask(player, *cast_lib, *cast_member));
+            match matte {
+                Ok(bytes) => {
+                    fs::write(format!("{}/{}", matte_dir(profile), filename), bytes)
+                        .expect("write furniture matte PNG");
+                    matte_masks_written += 1;
+                }
+                Err(error) => {
+                    decode_failures.push(format!("{}: {}", name, error));
+                    continue;
+                }
+            }
+        }
+
         collect_palette_table(&mut palette_tables, &parsed);
         let mut member_meta = serde_json::json!({
             "name": name,
@@ -361,6 +439,12 @@ pub(crate) async fn dump_furniture_profile(
                 }),
             );
         }
+        if profile.emit_matte_masks {
+            member_meta
+                .as_object_mut()
+                .expect("furniture member metadata object")
+                .insert("matteFilename".into(), serde_json::json!(filename));
+        }
         members_meta.push(member_meta);
     }
     decode_failures.sort();
@@ -380,9 +464,10 @@ pub(crate) async fn dump_furniture_profile(
     .expect("write _palettes.json");
 
     println!(
-        "  emitted {} member entries, {} PNGs -> {} ({} decode failures)",
+        "  emitted {} member entries, {} PNGs, {} matte masks -> {} ({} decode failures)",
         members_meta.len(),
         pngs_written,
+        matte_masks_written,
         png_dir(profile),
         decode_failures.len(),
     );
@@ -404,6 +489,7 @@ pub(crate) async fn dump_furniture_profile(
         folded_name_collisions,
         decode_failures,
         external_palette_renders,
+        matte_masks_written,
     }
 }
 

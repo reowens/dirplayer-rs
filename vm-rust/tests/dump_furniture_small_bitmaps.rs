@@ -8,6 +8,7 @@
 //!
 //! Output:
 //!   - <OUTPUT_ROOT>/furniture-small/data/<member_name>.png
+//!   - <OUTPUT_ROOT>/furniture-small/matte/<member_name>.png
 //!   - <OUTPUT_ROOT>/furniture-small/_cc_furniture_small_members.json
 //!   - <OUTPUT_ROOT>/furniture-small/_palettes.json
 //!
@@ -29,6 +30,7 @@ fn dump_furniture_small_cct_bitmaps() {
             members_sidecar: "_cc_furniture_small_members.json",
             dumper_name: "dump_furniture_small_bitmaps",
             external_palette_source_cct: Some("cc_furniture[1].cct"),
+            emit_matte_masks: true,
         })
         .await;
 
@@ -51,5 +53,6 @@ fn dump_furniture_small_cct_bitmaps() {
         assert_eq!(report.emitted_names.len(), 199);
         assert!(report.emitted_names.is_sorted());
         assert_eq!(report.external_palette_renders, 10);
+        assert_eq!(report.matte_masks_written, 199);
     });
 }

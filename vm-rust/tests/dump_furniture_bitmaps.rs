@@ -26,6 +26,7 @@ fn dump_furniture_cct_bitmaps() {
             members_sidecar: "_cc_furniture_members.json",
             dumper_name: "dump_furniture_bitmaps",
             external_palette_source_cct: None,
+            emit_matte_masks: false,
         })
         .await;
 
