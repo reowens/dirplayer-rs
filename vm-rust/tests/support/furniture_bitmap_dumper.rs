@@ -170,7 +170,12 @@ fn encode_matte_mask(
     let mut image = RgbaImage::new(bitmap.width as u32, bitmap.height as u32);
     for y in 0..bitmap.height {
         for x in 0..bitmap.width {
-            let alpha = if matte.get_bit(x, y) { 255 } else { 0 };
+            let source_alpha = if bitmap.use_alpha {
+                bitmap.get_pixel_color_with_alpha(&palettes, x, y).3
+            } else {
+                255
+            };
+            let alpha = if matte.get_bit(x, y) { source_alpha } else { 0 };
             image.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, alpha]));
         }
     }
