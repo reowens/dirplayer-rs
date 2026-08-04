@@ -37,6 +37,7 @@ pub(crate) struct FurnitureBitmapDumpReport {
     pub(crate) folded_name_collisions: Vec<(String, Vec<String>)>,
     pub(crate) decode_failures: Vec<String>,
     pub(crate) external_palette_renders: usize,
+    pub(crate) external_palette_members: Vec<(String, i32)>,
     pub(crate) matte_masks_written: usize,
 }
 
@@ -349,6 +350,7 @@ pub(crate) async fn dump_furniture_profile(
     let mut emitted_names: Vec<String> = Vec::new();
     let mut palette_tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut external_palette_renders = 0usize;
+    let mut external_palette_members = Vec::new();
     let mut matte_masks_written = 0usize;
 
     for (cast_lib, cast_member, name) in &targets {
@@ -358,6 +360,7 @@ pub(crate) async fn dump_furniture_profile(
         let json = match (external_palette_cast, external_palette) {
             (Some(palette_cast), Some(palette_member)) => {
                 external_palette_renders += 1;
+                external_palette_members.push((name.clone(), palette_member));
                 reserve_player_ref(|player| {
                     mcp_get_cast_member_picture_with_palette(
                         player,
@@ -489,6 +492,7 @@ pub(crate) async fn dump_furniture_profile(
         folded_name_collisions,
         decode_failures,
         external_palette_renders,
+        external_palette_members,
         matte_masks_written,
     }
 }

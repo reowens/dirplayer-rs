@@ -53,6 +53,22 @@ fn dump_furniture_small_cct_bitmaps() {
         assert_eq!(report.emitted_names.len(), 199);
         assert!(report.emitted_names.is_sorted());
         assert_eq!(report.external_palette_renders, 10);
+        assert_eq!(
+            report.external_palette_members,
+            [
+                "DJ_panel_small",
+                "DJ_stand_small",
+                "dog_small",
+                "dryer_small",
+                "pillow_small",
+                "poster arcade_sign_small",
+                "v_ball_small",
+                "victorian_chair_small",
+                "victorian_table_small",
+                "washing_machine_small",
+            ]
+            .map(|name| (name.to_string(), 1153))
+        );
         assert_eq!(report.matte_masks_written, 199);
     });
 }
